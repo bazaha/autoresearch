@@ -630,6 +630,34 @@ class ExploitTests(unittest.TestCase):
             with self.subTest(pred=str(pred)[:60]):
                 score.score_document(gold, pred)
 
+    def test_runaway_and_pathological_strings_are_bounded(self):
+        import time
+        self.assertIsNone(score.structure_key("C" * 20000))   # used to segfault RDKit canonicalization
+        t0 = time.time()
+        for v in ("12" + "\n" * 2000 + "nM", "1" * 500 + "-" + "1" * 500 + "x", "1" * 140 + "-" + "1" * 140 + "x"):
+            score.normalize_measurement(meas("1", v))
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_bad_prediction_lines_are_counted_not_fatal(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            gold_path, pred_path = os.path.join(tmp, "g.jsonl"), os.path.join(tmp, "p.jsonl")
+            with open(gold_path, "w") as f:
+                f.write(json.dumps(doc([{"smiles": ASPIRIN}], doc_id="d0")) + "\n")
+            with open(pred_path, "wb") as f:
+                f.write(json.dumps(doc([{"smiles": ASPIRIN}], doc_id="d0")).encode() + b"\n")
+                f.write(json.dumps({"doc_id": ["d1"]}).encode() + b"\n")
+                f.write(b"[" * 100000 + b"]" * 100000 + b"\n")
+                f.write(b'{"doc_id":"d1","compounds":[{"smiles":"C\xff"}]}\n')
+            per_doc, missing = score.score_files(gold_path, pred_path)
+        self.assertEqual((missing, per_doc[0]["struct_tp"]), (0, 1))
+
+    def test_label_primes_and_route_suffixes(self):
+        self.assertNotEqual(score._norm_label("1′"), score._norm_label("1"))
+        self.assertEqual(score._norm_label("1′"), score._norm_label("1'"))
+        self.assertEqual(score._context({"route": "口服给药"}, {}), (("route", "po"),))
+        self.assertEqual(score._context({"route": "oral administration"}, {}), (("route", "po"),))
+
     def test_markush_attachment_sets_do_not_collide(self):
         # floating groups attached to {1, 2} vs {12}: the old digit concatenation merged them
         key = score.structure_key

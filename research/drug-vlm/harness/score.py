@@ -80,6 +80,8 @@ VALUE_REL_TOL = 1e-3    # relative tolerance when gold and prediction use the sa
 STRIP_SALTS = True      # compare parent compounds (largest fragment, neutralized)
 MATCH_TARGET = True     # a record must also name the right target
 MAX_HEAVY_ATOMS = 500   # larger predicted structures are invalid (keeps scoring time bounded)
+MAX_SMILES_CHARS = 5000 # longer strings are invalid before RDKit sees them (runaway output can crash it)
+MAX_FIELD_CHARS = 300   # longer value/unit/endpoint/target strings make a record invalid (bounds regex time)
 MAX_PRED_COMPOUNDS = 5000   # per document; the rest count as invalid predictions
 MAX_PRED_RECORDS = 20000    # per document; the rest count as false positives
 BOOTSTRAP_SAMPLES = 1000
@@ -187,10 +189,10 @@ def _standardize(smiles):
     SMILES/CXSMILES -> standardized RDKit mol, or None if unparseable. Markush structures
     are not fragment-stripped: their floating substituents (CXSMILES m:) are fragments.
     """
-    if not isinstance(smiles, str) or not smiles.strip():
+    if not isinstance(smiles, str) or not smiles.strip() or len(smiles) > MAX_SMILES_CHARS:
         return None
     mol = Chem.MolFromSmiles(smiles.strip())
-    if mol is None:
+    if mol is None or mol.GetNumHeavyAtoms() > 2 * MAX_HEAVY_ATOMS:
         return None
     try:
         mol = Chem.RWMol(mol)
@@ -562,6 +564,7 @@ _ROUTES = {"iv": "iv", "intravenous": "iv", "intravenously": "iv", "ivbolus": "i
            "口服": "po", "灌胃": "po", "口服灌胃": "po", "経口": "po",
            "ip": "ip", "intraperitoneal": "ip", "腹腔": "ip", "腹腔注射": "ip",
            "sc": "sc", "subcutaneous": "sc", "皮下": "sc", "皮下注射": "sc"}
+_ROUTE_SUFFIXES = ("administration", "dosing", "给药", "投与", "投药")
 _WILD_TYPE = {"wt", "wildtype", "野生型"}
 _STRAINS_NORM = tuple(_norm_text(q) for q in _STRAINS)
 
@@ -790,6 +793,9 @@ def _context(m, from_endpoint, target=""):
             ctx[field] = _assay_type(v)
         elif field == "route":
             t = _norm_text(v)
+            for suffix in _ROUTE_SUFFIXES:
+                if t.endswith(suffix) and t[:-len(suffix)] in _ROUTES:
+                    t = t[:-len(suffix)]
             ctx[field] = _ROUTES.get(t, t)
         elif field == "variant":
             ctx[field] = _variant(v, target)
@@ -806,7 +812,7 @@ def _context(m, from_endpoint, target=""):
     return tuple(sorted((k, v) for k, v in ctx.items() if v))
 
 
-_NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?"
+_NUM = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?"   # unambiguous: no catastrophic backtracking
 _RANGE_SEP = r"(?:-|–|—|~|〜|to|至)"
 _RANGE = re.compile(rf"^({_NUM})\s*{_RANGE_SEP}\s*({_NUM})$", re.I)
 # a range with the unit after each bound: '10 µM–30 µM'
@@ -871,7 +877,9 @@ def _parse_value(raw, relation):
                     tuple(_half_unit_safe(repr(v) if isinstance(v, float) else str(v)) for v in items), relation, None, "")
         except (TypeError, ValueError, OverflowError):
             return None
-    s = _FOOTNOTE.sub("", str(raw).strip())
+    if len(str(raw)) > MAX_FIELD_CHARS:
+        return None
+    s = _FOOTNOTE.sub("", re.sub(r"\s+", " ", str(raw)).strip())
     s = _nfkc(s).strip()
     s = re.sub(r"^[‐‑‒–—−﹣－]\s*(?=[\d.])", "-", s).replace("−", "-")
     s = _decimal_commas(s)
@@ -926,6 +934,8 @@ def normalize_measurement(m, mw=None):
     the record-key-v2 fields (assay_type, species, matrix, variant, ph, dose, route), also
     when written in the header ('CLint (HLM)', 'logD7.4'); they count only where the gold has them.
     """
+    if any(len(str(m.get(f) or "")) > MAX_FIELD_CHARS for f in ("unit", "endpoint", "target", "relation", "conc", "conc_unit")):
+        return None
     parsed = _parse_value(m.get("value"), _nfkc(m.get("relation") or "").strip())
     if parsed is None:
         return None
@@ -990,9 +1000,9 @@ def _norm_label(s):
     """
     if not isinstance(s, (str, int, float)) or isinstance(s, bool):
         return ""
-    s = _LABEL_PREFIX.sub("", _nfkc(s).casefold().strip())
-    s = re.sub(r"(?<=\d)[^0-9a-z\u3400-\u9fff]+(?=\d)", "§", s)
-    return re.sub(r"[^0-9a-z\u3400-\u9fff§]+", "", s).replace("§", "-")
+    s = _LABEL_PREFIX.sub("", _nfkc(s).casefold().strip()).translate({0x2032: "'", 0x2033: "''", 0x2019: "'"})
+    s = re.sub(r"(?<=\d)[^0-9a-z'\u3400-\u9fff]+(?=\d)", "§", s)
+    return re.sub(r"[^0-9a-z'\u3400-\u9fff§]+", "", s).replace("§", "-")
 
 
 def _capped(items, cap):
@@ -1546,16 +1556,16 @@ def pool_seeds(runs):
 def _read_jsonl(path, strict=True):
     """Returns (rows, n_unparseable). Gold must parse; bad prediction lines are counted, not fatal."""
     rows, bad = [], 0
-    with open(path) as f:
+    with open(path, "rb") as f:
         for line in f:
             if not line.strip():
                 continue
             try:
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError("not a JSON object")
+                row = json.loads(line.decode("utf-8"))   # UnicodeDecodeError is a ValueError
+                if not isinstance(row, dict) or not isinstance(row.get("doc_id"), (str, int)) or isinstance(row.get("doc_id"), bool):
+                    raise ValueError("not a JSON object with a string or integer doc_id")
                 rows.append(row)
-            except ValueError:
+            except (ValueError, RecursionError):
                 if strict:
                     raise
                 bad += 1
