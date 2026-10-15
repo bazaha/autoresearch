@@ -68,6 +68,18 @@ class StructureKeyTests(unittest.TestCase):
         zn_salt = "CC(=O)Oc1ccccc1C(=O)[O-].CC(=O)Oc1ccccc1C(=O)[O-].[Zn+2]"
         self.assertEqual(score.structure_key(zn_salt), score.structure_key(ASPIRIN))
 
+    def test_parent_is_not_the_largest_fragment(self):
+        # pyrantel pamoate: the counterion is larger than the drug
+        pyrantel, oxantel = "CN1CCCN=C1/C=C/c1cccs1", "CN1CCCN=C1/C=C/c1cccc(O)c1"
+        pamoic = "OC(=O)c1cc2ccccc2c(Cc2c(O)c(C(=O)O)cc3ccccc23)c1O"
+        key = score.structure_key
+        self.assertEqual(key(pyrantel + "." + pamoic), key(pyrantel))
+        self.assertNotEqual(key(oxantel + "." + pamoic), key(pyrantel + "." + pamoic))
+        self.assertNotEqual(key(pamoic), key(pyrantel + "." + pamoic))
+        self.assertEqual(key("CCN.Cc1ccc(S(=O)(=O)O)cc1"), key("CCN"))           # tosylate
+        self.assertEqual(key("CC(=O)Oc1ccccc1C(=O)O[Mg]OC(=O)c1ccccc1OC(C)=O"), key(ASPIRIN))   # 2 equivalents
+        self.assertNotEqual(key(ASPIRIN + ".CCCCCCCC"), key(ASPIRIN))           # an unlisted co-component stays
+
     def test_atom_maps_and_labels_on_real_atoms_are_ignored(self):
         self.assertEqual(score.structure_key("[CH3:1][C:2](=O)O"), score.structure_key("CC(=O)O"))
         self.assertEqual(score.structure_key("[1*]c1ccc(C)cc1 |$;;;;Me;;;$|"), score.structure_key("[1*]c1ccc(C)cc1"))
@@ -169,7 +181,7 @@ class MeasurementTests(unittest.TestCase):
     def test_compound_units_canonicalize(self):
         self.assertEqual(score._norm_unit("mL·min⁻¹·kg⁻¹"), score._norm_unit("mL/min/kg"))
         self.assertEqual(score._norm_unit("mL min-1 kg-1"), "ml/min/kg")
-        self.assertEqual(score._norm_unit("µM"), "um")
+        self.assertEqual(score._norm_unit("µM"), score._norm_unit("umol/L") and "umolar")
 
     def test_single_dose_condition_must_match(self):
         at_1um = dict(meas("1", 87, unit="%", endpoint="% inhibition"), conc=1, conc_unit="uM")
@@ -282,6 +294,163 @@ class RecordKeyV2Tests(unittest.TestCase):
         self.assertEqual(record_tp(dict(logd, endpoint="logD7.4"), dict(logd, endpoint="logD", ph=6.5)), 0)
         self.assertEqual(record_tp(dict(logd, endpoint="logD7.4"), dict(logd, endpoint="logD")), 0)
         self.assertEqual(record_tp(dict(logd, endpoint="logD"), dict(logd, endpoint="logD7.4")), 1)
+
+
+def E(**k):
+    return dict(dict(target="", unit=""), **k)
+
+
+# (name, gold record(s), predicted record(s), expected record_tp). Found by red-teaming v1.6.
+HEADER_CASES = [
+    ("test concentration in brackets is a condition, not dropped",
+     [E(endpoint="% inhibition (1 µM)", value=45, target="EGFR"), E(endpoint="% inhibition (10 µM)", value=80, target="EGFR")],
+     [E(endpoint="% inhibition (1 µM)", value=80, target="EGFR"), E(endpoint="% inhibition (10 µM)", value=45, target="EGFR")], 0),
+    ("bracketed concentration == conc field", E(endpoint="% inhibition (1 µM)", value=45, target="EGFR"),
+     dict(E(endpoint="% inhibition", value=45, target="EGFR", unit="%"), conc=1, conc_unit="uM"), 1),
+    ("unrecognized qualifiers (cell lines) keep columns apart",
+     [E(endpoint="IC50 (HCT116)", value=1, unit="uM"), E(endpoint="IC50 (A549)", value=5, unit="uM")],
+     [E(endpoint="IC50 (HCT116)", value=5, unit="uM"), E(endpoint="IC50 (A549)", value=1, unit="uM")], 0),
+    ("WT and mutant columns stay apart",
+     [E(endpoint="IC50 (WT)", value=1, unit="nM", target="EGFR"), E(endpoint="IC50 (L858R)", value=5, unit="nM", target="EGFR")],
+     [E(endpoint="IC50 (WT)", value=5, unit="nM", target="EGFR"), E(endpoint="IC50 (L858R)", value=1, unit="nM", target="EGFR")], 0),
+    ("comma list in a bracket", E(endpoint="CL (rat, iv)", value=25, unit="mL/min/kg"),
+     E(endpoint="CL", value=25, unit="mL/min/kg", species="rat", route="iv"), 1),
+    ("AUC intervals are distinct endpoints",
+     [E(endpoint="AUC(0-t)", value=100, unit="ng·h/mL"), E(endpoint="AUC(0-∞)", value=120, unit="ng·h/mL")],
+     [E(endpoint="AUC(0-t)", value=120, unit="ng·h/mL"), E(endpoint="AUC(0-∞)", value=100, unit="ng·h/mL")], 0),
+    ("AUC interval spellings", E(endpoint="AUCinf", value=120, unit="ng·h/mL"), E(endpoint="AUC(0-∞)", value=120, unit="ng·h/mL"), 1),
+    ("interval bracket is not the unit", E(endpoint="AUC(0-24h) (ng·h/mL)", value="1200"), E(endpoint="AUC0-24", value=1.2, unit="µg·h/mL"), 1),
+    ("fullwidth text", E(endpoint="ＩＣ５０", value=5, unit="nM", target="EGFR"), E(endpoint="IC50", value=5, unit="nM", target="EGFR"), 1),
+    ("fullwidth percent", E(endpoint="F", value=45, unit="％"), E(endpoint="F", value=45, unit="%"), 1),
+    ("Japanese species", E(endpoint="CLint", value=12, unit="uL/min/mg", species="ヒト"),
+     E(endpoint="CLint", value=12, unit="uL/min/mg", species="rat"), 0),
+    ("Japanese endpoints", E(endpoint="阻害率", value=50, unit="%", target="EGFR"), E(endpoint="半減期", value=50, unit="%", target="EGFR"), 0),
+    ("incubation time in a bracket", E(endpoint="IC50 (72 h) (µM)", value="1.2", target="EGFR"),
+     E(endpoint="IC50", value=1200, unit="nM", target="EGFR", time="72 h"), 1),
+    ("unit next to a statistic", E(endpoint="IC50 (nM, n=3)", value="12", target="EGFR"), E(endpoint="IC50", value=12, unit="nM", target="EGFR"), 1),
+    ("parenthesized denominator", E(endpoint="CL", value=25, unit="mL/(min·kg)"), E(endpoint="CL", value=25, unit="mL/min/kg"), 1),
+    ("target written before the endpoint", E(endpoint="EGFR IC50", value=5, unit="nM", target="EGFR"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR"), 1),
+    ("assay type written before the endpoint", E(endpoint="Cellular IC50", value=5, unit="nM", target="EGFR"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR", assay_type="cell"), 1),
+    ("unit after a slash", E(endpoint="IC50/nM", value=5, target="EGFR"), E(endpoint="IC50", value=5, unit="nM", target="EGFR"), 1),
+    ("Chinese 值 suffix", E(endpoint="IC50值", value=5, unit="nM", target="EGFR"), E(endpoint="IC50", value=5, unit="nM", target="EGFR"), 1),
+    ("± SD in the header", E(endpoint="IC50 ± SD (nM)", value="5", target="EGFR"), E(endpoint="IC50", value=5, unit="nM", target="EGFR"), 1),
+    ("percent sign on a Chinese endpoint", E(endpoint="抑制率%", value=50, target="EGFR"),
+     E(endpoint="% inhibition", value=50, unit="%", target="EGFR"), 1),
+    ("matrix written before the endpoint", E(endpoint="HLM CLint", value=12, unit="uL/min/mg"),
+     E(endpoint="CLint", value=12, unit="uL/min/mg", matrix="HLM"), 1),
+    ("subscript pH", E(endpoint="logD₇.₄", value="2.1"), E(endpoint="logD7.4", value=2.1), 1),
+    ("pH in a bracket keeps logD columns apart",
+     [E(endpoint="LogD(7.4)", value="2.1"), E(endpoint="LogD(2.0)", value="0.5")],
+     [E(endpoint="LogD(7.4)", value="0.5"), E(endpoint="LogD(2.0)", value="2.1")], 0),
+    ("wild type spellings", E(endpoint="IC50", value=5, unit="nM", target="EGFR", variant="wild type"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR", variant="EGFR WT"), 1),
+    ("a dash is not wild type", E(endpoint="IC50", value=5, unit="nM", target="EGFR", variant="WT"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR", variant="—"), 0),
+    ("mutation written in the target", E(endpoint="IC50", value=5, unit="nM", target="EGFR", variant="L858R/T790M"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR T790M/L858R"), 1),
+    ("strain and plural", E(endpoint="CL", value=25, unit="mL/min/kg", species="rat"),
+     E(endpoint="CL", value=25, unit="mL/min/kg", species="SD rats"), 1),
+    ("Chinese strain", E(endpoint="CL", value=25, unit="mL/min/kg", species="大鼠"),
+     E(endpoint="CL", value=25, unit="mL/min/kg", species="SD大鼠"), 1),
+    ("rhesus is not cynomolgus", E(endpoint="CL", value=25, unit="mL/min/kg", species="rhesus"),
+     E(endpoint="CL", value=25, unit="mL/min/kg", species="cynomolgus"), 0),
+    ("cell line suffix", E(endpoint="IC50", value=1, unit="uM", cell_line="A549"),
+     E(endpoint="IC50", value=1, unit="uM", cell_line="A549 cells"), 1),
+    ("assay type suffix", E(endpoint="IC50", value=5, unit="nM", target="EGFR", assay_type="biochemical"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR", assay_type="enzymatic assay"), 1),
+    ("Chinese assay type", E(endpoint="IC50", value=5, unit="nM", target="EGFR", assay_type="cell"),
+     E(endpoint="IC50", value=5, unit="nM", target="EGFR", assay_type="细胞水平"), 1),
+    ("route spellings", E(endpoint="CL", value=25, unit="mL/min/kg", route="po"),
+     E(endpoint="CL", value=25, unit="mL/min/kg", route="oral gavage"), 1),
+    ("pH field with text", E(endpoint="logD", value=2.1, ph=7.4), E(endpoint="logD", value=2.1, ph="pH 7.4"), 1),
+    ("dose as one string", E(endpoint="AUC", value=1200, unit="ng·h/mL", dose=10, dose_unit="mg/kg"),
+     E(endpoint="AUC", value=1200, unit="ng·h/mL", dose="10 mg/kg"), 1),
+    ("direction spelled 'to'", E(endpoint="Papp (A to B)", value=12, unit="10-6 cm/s"), E(endpoint="Papp A→B", value=12, unit="10-6 cm/s"), 1),
+    ("direction next to the unit", E(endpoint="Papp (A→B, ×10⁻⁶ cm/s)", value=12), E(endpoint="Papp (B→A, ×10⁻⁶ cm/s)", value=12), 0),
+    ("apical/basolateral", E(endpoint="Papp (AP→BL)", value=12, unit="cm/s"), E(endpoint="Papp (BL→AP)", value=12, unit="cm/s"), 0),
+    ("Greek letter names", E(endpoint="IC50", value=5, unit="nM", target="GSK-3β"), E(endpoint="IC50", value=5, unit="nM", target="GSK3beta"), 1),
+]
+
+
+P = lambda **k: E(endpoint="Papp A→B", **k)
+I = lambda **k: E(endpoint="IC50", target="EGFR", **k)
+
+# Units and value strings (red team, v1.6).
+UNIT_CASES = [
+    ("multiplier with mantissa", P(value="12", unit="×10⁻⁶ cm/s"), P(value=12, unit="1×10⁻⁶ cm/s"), 1),
+    ("multiplier in brackets", P(value="12", unit="×10⁻⁶ cm/s"), P(value=12, unit="(×10⁻⁶ cm/s)"), 1),
+    ("en-dash exponent", P(value="12", unit="×10⁻⁶ cm/s"), P(value=12, unit="×10–6 cm/s"), 1),
+    ("trailing multiplier", P(value="12", unit="×10⁻⁶ cm/s"), P(value=12, unit="cm/s ×10⁻⁶"), 1),
+    ("a multiplier is never dropped", P(value="12", unit="cm/s"), P(value=12, unit="1×10⁻⁶ cm/s"), 0),
+    ("dose in a bracket", E(endpoint="Cmax (10 mg/kg)", value=100, unit="ng/mL"), E(endpoint="Cmax (30 mg/kg)", value=100, unit="ng/mL"), 0),
+    ("capital X exponent", I(value="1.2e-8", unit="M"), I(value="1.2 X 10-8", unit="M"), 1),
+    ("spaced E exponent", I(value="1.2e-8", unit="M"), I(value="1.2 E-8", unit="M"), 1),
+    ("HTML superscript", I(value="1.2e-8", unit="M"), I(value="1.2×10<sup>-8</sup>", unit="M"), 1),
+    ("± with an exponent", I(value="1.2e-8", unit="M"), I(value="1.2 ± 0.3 × 10⁻⁸", unit="M"), 1),
+    ("decimal comma is not dropped", I(value="5", unit="uM"), I(value="0,5", unit="uM"), 0),
+    ("decimal comma", I(value="0.5", unit="uM"), I(value="0,5", unit="uM"), 1),
+    ("tilde range", I(value=[10, 30], unit="nM"), I(value="10~30 nM"), 1),
+    ("fullwidth tilde range is not a single value", I(value="10", unit="nM"), I(value="10～30 nM"), 0),
+    ("range with repeated units", I(value=[10, 30], unit="uM"), I(value="10 µM–30 µM"), 1),
+    ("fullwidth relations stay apart", I(value="＜10 nM"), I(value="＞10 µM"), 0),
+    ("fullwidth relation field", I(value=10, unit="nM", relation="＜"), I(value=10, unit="nM", relation="＞"), 0),
+    ("fullwidth less-than", I(value="<10", unit="nM"), I(value="＜10", unit="nM"), 1),
+    ("≦", I(value="<10", unit="nM"), I(value="≦10", unit="nM"), 1),
+    ("fullwidth unit", I(value=10, unit="nM"), I(value=10, unit="ｎＭ"), 1),
+    ("en-dash minus", E(endpoint="logD", value=-0.5), E(endpoint="logD", value="–0.5"), 1),
+    ("footnote marks do not make values collide", I(value="1.2†", unit="nM"), I(value="12*", unit="uM"), 0),
+    ("footnote mark", I(value="12", unit="nM"), I(value="12*", unit="nM"), 1),
+    ("superscript footnote letter", I(value="12", unit="nM"), I(value="12ᵃ", unit="nM"), 1),
+    ("value with its range in brackets", I(value="12", unit="nM"), I(value="12 (10–15)", unit="nM"), 1),
+    ("string concentrations stay apart", dict(I(value=50, unit="%"), endpoint="% inhibition", conc="10 µM"),
+     dict(I(value=50, unit="%"), endpoint="% inhibition", conc="1 µM"), 0),
+    ("string concentration", dict(I(value=50, unit="%"), endpoint="% inhibition", conc=1, conc_unit="uM"),
+     dict(I(value=50, unit="%"), endpoint="% inhibition", conc="1 µM"), 1),
+    ("unit qualifier word", E(endpoint="CLint", value=12, unit="µL/min/mg"), E(endpoint="CLint", value=12, unit="µL/min/mg protein"), 1),
+    ("en-dash inverse exponents", E(endpoint="CL", value=1.5, unit="L/h/kg"), E(endpoint="CL", value=1.5, unit="L·h–1·kg–1"), 1),
+    ("amount per volume is molar", E(endpoint="Cmax", value=1, unit="µM"), E(endpoint="Cmax", value=1, unit="nmol/mL"), 1),
+    ("molar inside a compound unit", E(endpoint="AUC", value=5, unit="µM·h"), E(endpoint="AUC", value=5, unit="nmol·h/mL"), 1),
+    ("Chinese unit words", I(value=10, unit="微摩尔/升"), I(value=10, unit="纳摩尔/升"), 0),
+    ("Chinese = symbol", I(value=10, unit="μmol/L"), I(value=10, unit="微摩尔/升"), 1),
+    ("Chinese time units", E(endpoint="t1/2", value=2, unit="小时"), E(endpoint="t1/2", value=2, unit="分钟"), 0),
+    ("Chinese hours", E(endpoint="t1/2", value=2, unit="h"), E(endpoint="t1/2", value=2, unit="小时"), 1),
+    ("a unit is never equal to no unit", E(endpoint="t1/2", value=2, unit="小时"), E(endpoint="t1/2", value=2, unit=""), 0),
+    ("pH and unit in one bracket", E(endpoint="Solubility (pH 7.4, µM)", value="50"), E(endpoint="solubility", value=50, unit="uM", ph=7.4), 1),
+    ("unit and matrix in one bracket", E(endpoint="CLint (µL/min/mg, HLM)", value="12"),
+     E(endpoint="CLint", value=12, unit="uL/min/mg", matrix="HLM"), 1),
+    ("unit after a slash in t1/2", E(endpoint="t1/2/h", value="2"), E(endpoint="t1/2", value=2, unit="h"), 1),
+    ("fraction vs percent", E(endpoint="fu", value="0.05"), E(endpoint="fu", value=5, unit="%"), 1),
+    ("percent vs fraction unit", E(endpoint="F", value=45, unit="%"), E(endpoint="F", value=0.45, unit="fraction"), 1),
+]
+
+
+class UnitParsingTests(unittest.TestCase):
+    def test_unit_cases(self):
+        for name, gold_m, pred_m, want in UNIT_CASES:
+            gold = doc([{"id": "1", "smiles": ASPIRIN}], [dict(compound_id="1", **gold_m)])
+            pred = doc([{"id": "1", "smiles": ASPIRIN}], [dict(compound_id="1", **pred_m)])
+            with self.subTest(name):
+                self.assertEqual(score.score_document(gold, pred)["record_tp"], want)
+
+    def test_overflow_is_an_invalid_record_not_a_crash(self):
+        for value, unit, endpoint in (("1e400", "nM", "IC50"), ("1.2 ×10^400", "nM", "IC50"), (-400, "", "pIC50")):
+            self.assertIsNone(score.normalize_measurement(meas("1", value, unit=unit, endpoint=endpoint)))
+        gold = doc([{"id": "1", "smiles": ASPIRIN}], [meas("1", 5)])
+        pred = doc([{"id": "1", "smiles": ASPIRIN}], [meas("1", "1e400"), dict(meas("1", 5), dose="1", dose_unit="10^400 mg/kg")])
+        self.assertEqual(score.score_document(gold, pred)["n_pred_rec"], 2)
+
+
+class HeaderParsingTests(unittest.TestCase):
+    def test_header_cases(self):
+        for name, gold_m, pred_m, want in HEADER_CASES:
+            g = gold_m if isinstance(gold_m, list) else [gold_m]
+            p = pred_m if isinstance(pred_m, list) else [pred_m]
+            gold = doc([{"id": "1", "smiles": ASPIRIN}], [dict(compound_id="1", **m) for m in g])
+            pred = doc([{"id": "1", "smiles": ASPIRIN}], [dict(compound_id="1", **m) for m in p])
+            with self.subTest(name):
+                self.assertEqual(score.score_document(gold, pred)["record_tp"], want)
 
 
 class DocumentScoringTests(unittest.TestCase):
@@ -422,6 +591,54 @@ class DocumentScoringTests(unittest.TestCase):
         self.assertEqual(stereo_wrong["struct_tanimoto"], 1.0)  # Morgan FP ignores chirality
 
 
+class ExploitTests(unittest.TestCase):
+    """Found by red-teaming v1.6: ways to score higher without being more correct, and crashes."""
+
+    def test_hedging_around_an_unscorable_gold_compound_does_not_pay(self):
+        gold = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": "polymer-not-smiles"}], [meas("1", 10), meas("2", 20)])
+        honest = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": PARACETAMOL}], [meas("1", 10), meas("2", 20)])
+        hedge = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "1b", "smiles": PARACETAMOL}], [meas("1", 10), meas("1", 99), meas("1b", 10)])
+        h = score.aggregate([score.score_document(gold, honest)])
+        g = score.aggregate([score.score_document(gold, hedge)])
+        self.assertEqual((h["struct_precision"], h["record_precision"]), (1.0, 1.0))
+        self.assertLess(g["struct_precision"], 1.0)
+        self.assertLess(g["record_precision"], 1.0)
+
+    def test_labels_do_not_collide(self):
+        self.assertEqual(len({score._norm_label(x) for x in ("1-11", "11-1", "111")}), 3)
+        self.assertEqual(score._norm_label("Excipient"), "excipient")
+        self.assertEqual({score._norm_label(x) for x in ("Ex. 12a", "Compound 12a", "12 a", "cpd 12a")}, {"12a"})
+        phenol, aniline = "Oc1ccccc1", "Nc1ccccc1"
+        gold = doc([{"id": "1-11", "smiles": phenol}, {"id": "11-1", "smiles": aniline}], [meas("1-11", 10), meas("11-1", 20)])
+        reordered = doc([{"id": "11-1", "smiles": aniline}, {"id": "1-11", "smiles": phenol}], [meas("1-11", 10), meas("11-1", 20)])
+        swapped = doc([{"id": "1-11", "smiles": phenol}, {"id": "11-1", "smiles": aniline}], [meas("1-11", 20), meas("11-1", 10)])
+        self.assertEqual(score.score_document(gold, reordered)["record_tp"], 2)
+        self.assertEqual(score.score_document(gold, swapped)["record_tp"], 0)
+
+    def test_malformed_predictions_never_crash(self):
+        gold = doc([{"id": "1", "smiles": ASPIRIN}], [meas("1", 10)])
+        many_groups = ("*F.*Cl.*Br.*I.*C.*O.*N.*CC.*OC.*C#N.*SC.*CF.c1ccccc1 |" +
+                       ",".join(f"m:{i}:29.30.31.32.33.34" for i in (0, 2, 4, 6, 8, 10, 12, 14, 17, 20, 23, 26)) + "|")
+        for pred in (doc([{"id": "1", "smiles": ASPIRIN}], [meas("1", [])]),
+                     {"doc_id": "d1", "compounds": [{"id": "1", "smiles": ASPIRIN}], "measurements": [None]},
+                     {"doc_id": "d1", "compounds": ["CCO"]},
+                     {"doc_id": "d1", "compounds": [{"id": "1", "smiles": [ASPIRIN]}]},
+                     doc([{"id": "1", "smiles": ASPIRIN}], [meas("1", 10 ** 400)]),
+                     {"doc_id": "d1", "compounds": "CCO", "measurements": "x"},
+                     doc([{"id": "1", "smiles": many_groups}]),
+                     ["not a document"]):
+            with self.subTest(pred=str(pred)[:60]):
+                score.score_document(gold, pred)
+
+    def test_markush_attachment_sets_do_not_collide(self):
+        # floating groups attached to {1, 2} vs {12}: the old digit concatenation merged them
+        key = score.structure_key
+        a = key("*Cl.*F.c1ccc2ccccc2c1 |m:0:2.3,m:2:2|")
+        b = key("*Cl.*F.c1ccc2ccccc2c1 |m:0:2,m:2:2.3|")
+        self.assertIsNotNone(a)
+        self.assertNotEqual(a, b)
+
+
 class FileScoringTests(unittest.TestCase):
     def test_bad_prediction_lines_and_missing_docs_score_as_empty(self):
         import json, os, tempfile
@@ -437,7 +654,8 @@ class FileScoringTests(unittest.TestCase):
             per_doc, missing = score.score_files(gold_path, pred_path)
         self.assertEqual(missing, 2)
         self.assertAlmostEqual(score.aggregate(per_doc)["struct_recall"], 1 / 3)
-        self.assertEqual(score.aggregate(per_doc)["struct_precision"], 1.0)
+        # crops: a missing answer costs what a wrong one costs, so precision drops too
+        self.assertAlmostEqual(score.aggregate(per_doc)["struct_precision"], 1 / 3)
 
 
 class StatisticsTests(unittest.TestCase):
@@ -534,6 +752,66 @@ class StatisticsTests(unittest.TestCase):
         self.assertLess(r99["ci_lo"], r90["ci_lo"])
         self.assertGreater(r99["ci_hi"], r90["ci_hi"])
         self.assertEqual(r90["p_not_better"], r99["p_not_better"])
+
+    def test_abstaining_is_no_better_than_guessing(self):
+        def crops(n_right, n_wrong, n_empty):
+            rows = []
+            for i in range(n_right + n_wrong + n_empty):
+                gold = doc([{"smiles": ASPIRIN}], doc_id=f"d{i}")
+                pred = doc([{"smiles": ASPIRIN}] if i < n_right else [{"smiles": PARACETAMOL}] if i < n_right + n_wrong else [],
+                           doc_id=f"d{i}")
+                rows.append(score.score_document(gold, pred))
+            return score.aggregate(rows, scalar="struct_f1")["score"]
+        self.assertAlmostEqual(crops(70, 30, 0), 0.70)
+        self.assertAlmostEqual(crops(70, 0, 30), 0.70)
+        self.assertLess(crops(60, 0, 40), crops(70, 30, 0))
+
+    def test_rates_stay_in_unit_interval(self):
+        gold = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": "not-a-smiles"}],
+                   [meas("1", 12.3), meas("2", 450.0)])
+        pred = doc([{"id": "1", "smiles": "C1CC"}, {"id": "2", "smiles": "C(C"}], [meas("1", 12.3), meas("2", 450.0)])
+        s = score.aggregate([score.score_document(gold, pred)])
+        self.assertEqual(s["invalid_smiles_rate"], 1.0)
+        good = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": PARACETAMOL}], [meas("1", 12.3), meas("2", 450.0)])
+        s = score.aggregate([score.score_document(gold, good)])
+        self.assertLessEqual(s["record_f1_by_label"], 1.0)
+
+    def test_families_spanning_slices_resample_together(self):
+        rows = []
+        for i in range(10):
+            for dt in ("paper", "si"):
+                gold = dict(doc([{"smiles": ASPIRIN}], doc_id=f"a{i}-{dt}"), family_id=f"a{i}", doc_type=dt)
+                rows.append(score.score_document(gold, doc([{"smiles": ASPIRIN if i % 2 else PARACETAMOL}], doc_id=f"a{i}-{dt}")))
+        by_type = score.regroup(rows, "doc_type")
+        self.assertEqual({d["slice"] for d in by_type}, {"paper", "si"})
+        r = score.paired_compare(by_type, by_type, slice_weights={"paper": 1, "si": 1})
+        self.assertEqual(r["n_clusters"], 10)
+
+    def test_slice_weights_must_cover_every_slice(self):
+        rows = self._sliced([("mrbw", 5, 10, ()), ("MRBW", 0, 10, ())])
+        with self.assertRaises(ValueError):
+            score.check_slice_weights(rows, {"mrbw": 1.0})
+        used, absent = score.check_slice_weights(rows, {"mrbw": 1.0, "inhouse": 1.0}, allow_unweighted=True)
+        self.assertEqual((used, absent), ({"mrbw": 1.0}, ["inhouse"]))
+
+    def test_compare_refuses_runs_scored_on_different_gold(self):
+        a, b = self._per_doc(60, 100), self._per_doc(60, 120)
+        with self.assertRaises(ValueError):
+            score.paired_compare(a, b)
+        self.assertEqual(score.paired_compare(a, b, require_same_docs=False)["n_shared"], 100)
+        tagged = lambda rows, h: [dict(d, gold=h) for d in rows]
+        with self.assertRaises(ValueError):
+            score.paired_compare(tagged(a, "aaa"), tagged(a, "bbb"))
+
+    def test_null_simulation_runs_against_this_scorer(self):
+        import numpy as np
+        import null_sim
+        saved = score.BOOTSTRAP_SAMPLES
+        try:
+            pooled, hier, seeds = null_sim.trial(np.random.default_rng(0), 0.03)
+        finally:
+            score.BOOTSTRAP_SAMPLES = saved
+        self.assertEqual(len(seeds), null_sim.SEEDS)
 
 if __name__ == "__main__":
     unittest.main()

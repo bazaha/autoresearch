@@ -5,7 +5,7 @@
 >
 > 这是给 agent 的研究方针，对应上游仓库根目录的 `program.md`。**人类负责迭代这个文件，agent 只读。**
 > 方括号里的数字（如 `[0.5]`）是准备阶段校准之前的默认值，校准后由人类写入 `harness/keep_rule.yaml` 并冻结；
-> 两者不一致时以 `keep_rule.yaml` 为准。设计依据见 `README.md` 第 5、6 节和 `evidence/design_synthesis.md`。
+> 两者不一致时以 `keep_rule.yaml` 为准。设计依据见 `README.md` 第 6 节与 `docs/design.md`（其中的数字若与本文件或 `keep_rule.yaml` 不一致，以后两者为准）。
 
 这是一个让 LLM 自己做研究的实验：在固定的数据、固定的评测和固定的训练预算下，
 把一个视觉语言模型（VLM）微调得更会"读"药物研发文献和专利里画的化学结构。
@@ -20,10 +20,12 @@
 |---|---|
 | 在位者（incumbent） | 当前最好的提交，即分支 `autoresearch/<tag>` 的 HEAD。**只有 runner 能移动这个分支** |
 | W0 | 热启动检查点（Qwen3-VL-2B 上一次性训练好的结构识别模型），相当于上游的分词器：只读、每个阶段固定。每次实验都从 W0 开始 |
-| DEV / 开发集 | 约 3,400 张裁剪图，决定保留/丢弃；你只看到四舍五入的聚合值 |
-| CONFIRM / 隐藏确认集 | 约 2,100 张从未用于开发的裁剪图；每次只返回"通过/不通过"一个比特，每天最多 [10] 次 |
+| DEV / 开发集 | 约 2,800 张裁剪图（第 3 周加入内部 600 张后约 3,400），决定保留/丢弃；你只看到四舍五入的聚合值 |
+| CONFIRM / 隐藏确认集 | 约 1,700 张（之后约 2,100）从未用于开发的裁剪图；只告诉你通过或不通过，每天最多 [10] 次 |
 | SEALED / 封存测试集 | 只在阶段关口由人类使用，你永远看不到 |
-| dev-viz / 可视化集 | 约 300 张单独留出的裁剪图，**给你看逐条预测与金标**，用于错误分析 |
+| dev-viz / 可视化集 | 约 250 张（之后约 300）单独留出的裁剪图，**给你看逐条预测与金标**，用于错误分析 |
+| 来源切片 / 难度标签 | `slice` 是数据来源（`inhouse`、`biovista`、`uspto`、`mrbw` = MolRecBench-Wild）；`tag` 是难度子集（`chiral`、`abbrev`、`large`、`lowres`），一张图可以有多个标签。两者合称"分组" |
+| 层次 bootstrap | 同时重采样专利族和种子的配对检验（`score.py compare`），给出增量的置信区间和 `p_not_better` |
 | R0 / R1 / R2 | 实验的"梯级"：R0 = 60 秒冒烟测试；R1 = 2B 模型在固定预算下的正式实验（本循环）；R2 = 8B 模型的长程复核（runner 每周或按需运行） |
 | pp | 百分点。本文件和 run.sh 输出里所有增量都以 pp 为单位、带 `_pp` 后缀；比率带 `_pct` 后缀 |
 | 准备阶段 | 第 1–2 周的基础设施与噪声校准（README 第 8 节）。不要和 S1/S2 阶段混淆 |
@@ -41,11 +43,11 @@ BioMiner 在 BioVista 上数值召回约 0.85、结构召回只有 0.58；去掉
 - 每张裁剪图上，`struct_f1` 就是精确匹配：预测结构与金标结构的**标准化母体分子**（去盐、中和）的**带立体信息的标准 InChIKey** 相同才算对；
   外消旋/相对构型（CXSMILES 增强立体 `&1`/`o1`）和带 R 基团的结构按规范 CXSMILES 比较。
 - **立体是严格的**：画了楔形键却输出无立体，或者凭空编出立体，都算错。Tanimoto 相似度只做诊断，从不参与判定。
-- 无法解析、无法转换、用了缩写表里没有的缩写、超时没有输出——都算错；多给的结构算假阳性。
+- 无法解析、无法转换、用了缩写表里没有的缩写、超时或没有输出——都算错，而且**没有输出和答错同价**（弃答不会更划算）；多给的结构算假阳性。
 - **与输出表示无关**：你的模型用 SMILES、CXSMILES、molfile 还是原子/键 JSON 输出都可以，`harness/formats.py` 先把它转成 RDKit 分子再打分。
   就像 `val_bpb` 与词表大小无关，"换一种输出表示"是可以公平尝试的实验。
-- 计算方式：`python3 harness/score.py score --scalar struct_f1 --slice-weights inhouse=0.3,biovista=0.3,uspto=0.2,mrbw=0.2`。
-  你可以读 `harness/score.py` 来理解指标，但它是只读的。
+- 计算方式（runner 负责填入金标与预测文件）：`python3 harness/score.py score --gold <开发集金标> --pred <预测> --scalar struct_f1 --slice-weights inhouse=0.3,biovista=0.3,uspto=0.2,mrbw=0.2`。
+  你可以读 `harness/score.py` 和 `harness/README.md` 来理解指标，但它们是只读的。
 
 S1 的 DEV 和 CONFIRM **不含 Markush 通式**。Markush（IP5-M/M2S/USPTO-M）每晚单独作为诊断报告，不参与保留/丢弃。
 SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 program.md。
@@ -55,18 +57,22 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 | 组件 | 作用 | 状态 | 验收方式 |
 |---|---|---|---|
 | `harness/score.py` + `test_score.py` | 固定评分（相当于 `evaluate_bpb`） | 已有 v1.5 | `python3 -m unittest discover -s harness -p "test_*.py"` 全部通过 |
-| `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | 层次 bootstrap 的误保留率不高于名义水平 |
+| `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | `python3 harness/null_sim.py`：层次 bootstrap 的误保留率不高于名义水平 |
 | `harness/formats.py` + `abbrev_v1.tsv` + `golden_pairs.tsv` | 各种输出格式 → RDKit 分子；超原子缩写展开 | 待建 | 约 200 条黄金对（互变异构、盐、E/Z、增强立体、R 基团、同位素、金属）全过；缩写表能复现每一个含超原子的金标 |
 | `harness/dvlm/`（`load_base`、`pools`、`Meter`、`render`、增强算子、`rewards`、`save_adapter`） | 训练侧的唯一入口 | 待建 | Meter 计数与优化器步数相差 ≤ 2%；`render` 的数据门禁能拦截评测分子 |
 | `harness/dvlm/rewards` | 训练用奖励，复用 score.py 的结构键 | 待建 | 在 golden_pairs 上与 score.py 判定完全一致 |
-| `harness/prepare.py` | 常量（STAGE、TOKEN_BUDGET、各种上限）；构建数据池、评测分层和 W0 | 待建 | `./run.sh --check` 的清单与哈希检查通过 |
+| `harness/prepare.py` | 常量（STAGE、TOKEN_BUDGET、各种上限）；构建数据池、评测层级和 W0 | 待建 | `./run.sh --check` 的清单与哈希检查通过 |
 | W0-2B 检查点 | 热启动 | 待建 | DEV 上 ≥ 零样本 + 20 pp |
-| `harness/evalserver.py`（vLLM + LoRA 热切换） | 固定推理，支持第 4 节 `infer_config` 的全部字段 | 待建 | 同一 adapter 评两次，分数差 ≤ 0.1 pp |
+| `harness/evalserver.py`（vLLM + LoRA 热切换） | 固定推理，支持第 4 节 `infer_config` 的全部字段 | 待建 | 同一 adapter 评两次，分数差 ≤ [0.1] pp |
+| `harness/probes.py` + 探针/金丝雀/扰动集 | 计算 `probe`、`canary_gap`、`perturb_gap` 与负对数似然 | 待建 | 三个集合就位；同一 adapter 重算差 ≤ [0.5] pp |
 | `harness/keep_rule.py` + `keep_rule.yaml` | 第 6 节的判定流程 | 待建 | 20 个安慰剂实验中被判为 promising 的 ≤ 20%；阈值冻结 |
 | `harness/runner.py` + `run.sh` | 门禁、容器、回执，`results.tsv` 与 `lineage.jsonl` 的唯一写入者 | 待建 | 20 次试运行回执全部有效 |
-| 评测分层 `/srv/dvlm/eval/{viz,dev,confirm,reserve,sealed}` | 按文章/专利族划分，InChIKey 第一段跨层去重 | 待建 | 重叠审计为 0 |
+| 评测层级 `/srv/dvlm/eval/{viz,dev,confirm,reserve,sealed,probe,canary,perturb}` | 按文章/专利族划分，InChIKey 第一段跨层去重 | 待建 | 重叠审计为 0 |
 | `train.py` 基线 | W0 + LoRA 的最简单配方（约 400 行） | 待建 | `./run.sh --smoke` 60 秒内跑通 |
-| `.gitignore` 包含 `notes/`、`requests.md`、`results.tsv`、`lineage.jsonl`、`runs/` | 这些文件不进入提交 | 待建 | `git status` 干净 |
+| `.gitignore` 包含 `notes/`、`requests.md`、`results.tsv`、`lineage.jsonl`、`failed_descriptors.tsv`、`runs/` | 这些文件不进入提交 | 待建 | `git status` 干净 |
+| 环境：8×H100 节点、支持 `--network none` 的容器运行时、`uv.lock` 锁定 transformers/peft/trl/vllm/`rdkit==2026.09.1`、验证过 Qwen3-VL LoRA 热切换的 vLLM | 可复现的运行环境 | 待建 | 同一镜像两次构建哈希一致 |
+
+构建顺序、负责人和人日估算见 `docs/design.md` 第 2 节；那里也定义了第一个自主夜晚之前的"最低可用配置"。`./run.sh --check` 逐行运行上表的验收项并打印 PASS/FAIL。
 
 ## 3. 准备工作（Setup）
 
@@ -75,9 +81,9 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 1. **约定运行标签**：基于日期，例如 `oct29-s1`。由 runner 创建分支 `autoresearch/<tag>`（必须是新分支）。
 2. **通读这些文件**：
    - 本文件；
-   - `README.md`（本项目的调研报告）：至少读第 0 节和第 6 节，想法先验的来源在第 3 节；
+   - `README.md`（本项目的调研报告）：读第 3 节（技术现状）和 4.3 节（合成数据），它们是想法先验的来源。第 5、6 节和 `docs/` 是给人类的设计说明，其中的数字若与本文件或 `keep_rule.yaml` 不一致，以后两者为准；
    - `train.py`：你唯一可以修改的文件；
-   - `harness/dvlm/` 各函数的 docstring：数据、预算、渲染和保存都只能通过它；
+   - `harness/dvlm/` 各函数的 docstring（接口草案见 `docs/design.md` 2.3 节）：数据、预算、渲染、奖励和保存都只能通过它；
    - `harness/score.py`：只为理解指标而读；
    - `results.tsv`、`lineage.jsonl`、`failed_descriptors.tsv`（如果已有）：以前试过什么、为什么失败。
 3. **确认环境就绪**：`./run.sh --check`。任何一项不通过，告诉人类，不要自己修。
@@ -95,14 +101,15 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 | 字段 | 取值 |
 |---|---|
 | `prompt` | ≤ 2,000 字符，不得含类 SMILES 字符串（会被扫描） |
-| `output_format` | `formats.py` 注册表中的一项：`smiles`、`cxsmiles`、`molfile`、`graph_json_v1`；加前缀 `cot+`（如 `cot+smiles`）表示先自由推理、只解析最后一个 `<answer>…</answer>` 里的内容 |
+| `output_format` | `formats.py` 注册表中 S1 可用的一项：`smiles`、`cxsmiles`、`molfile`、`graph_json_v1`；加前缀 `cot+`（如 `cot+smiles`）表示先自由推理、只解析最后一个 `<answer>…</answer>` 里的内容（`rgroup_table_v1`、`records_yaml_v1`、`iupac_name` 只在 S2 开放） |
 | `grammar_id` | `none` 或注册表中的语法（如 `smiles_v1`），用于约束解码 |
 | `max_pixels` | ≤ 1024²；`pad_to_square`：`true`/`false`（保持长宽比的填充） |
 | `tiling` | `none` 或 `auto`（长边 > [1,024] 像素的图额外以 2×2 切块 + 全图的多图形式输入） |
-| `decoding` | `greedy`，或 `vote`（k ≤ 4，温度 ≤ 1.0，按 InChIKey 多数投票） |
+| `decoding` | `greedy`，或 `vote`（k ≤ 4，温度 ≤ 1.0，按 score.py 的结构键多数投票，外消旋与对映体不会被合并） |
 | `max_new_tokens` | ≤ [2,048] |
 
-- adapter 存到 `/out/adapter`：只在 LLM 线性层上的 LoRA 走快路径（热切换）；改了 ViT 或全参的走慢路径（合并后重新加载，评测多约 4 分钟，计入评测墙钟）。
+- 用 `dvlm.save_adapter(model, infer_config)` 同时写 `/out/adapter` 和 `/out/infer_config.json`。文件缺失时 evalserver 用 W0 的默认配置（W0 默认提示、`smiles`、`grammar_id: none`、`max_pixels: 512²`、`pad_to_square: false`、`tiling: none`、`greedy`、`max_new_tokens: 1024`）；字段越界或提示词含类 SMILES 字符串 → 训练前的静态检查返回 `gate_fail`，不会静默截断。
+- 只在 LLM 线性层上的 LoRA 走快路径（热切换）；改了 ViT 或全参的走慢路径（合并后重新加载，评测多约 4 分钟，计入评测墙钟）。
 
 **不可以：**
 - 修改 `train.py` 以外的任何文件。提交里出现其他文件 → `gate_fail`。**提交时只用 `git commit train.py`（或 `git add train.py`），不要用 `git add -A`。**
@@ -130,17 +137,17 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 **提交说明的格式**（runner 从这里读取描述符等信息）：
 
 ```
-一句话假设：手性样本 2× 过采样能提升手性切片
+一句话假设：手性样本 2× 过采样能提升手性标签
 
-Desc: stereo_x2
-Expect: +0.8 pp 总体；chiral 切片 +2 pp
+Desc: stereo_oversample=2
+Expect: +0.8 pp 总体；chiral 标签 +2 pp
 ```
 
 - `Desc:`（必填）：规范化的"改动描述符"，用 `|` 分隔的 `键=值`，例如 `lr_llm=2e-4|lora=attn|r=64`。
 - `Expect:`（必填）：预期增量。事后对照预期和结果，是你校准直觉的方式。
 - `Differs-From: <commit>` + `Changed: ……`：只在描述符与 `failed_descriptors.tsv` 中已失败的条目重复时需要，写明这次哪里不同；缺了 → `gate_fail`。
 - `Fix-Of: <commit>`：修复同一想法的崩溃时使用（最多 2 次），不算重复描述符。
-- 学习率、调度、warmup、分辨率、tiling 类描述符由 runner 自动标为**长程敏感**（短跑结论可能不迁移到长训练），也可以手动写 `Horizon: yes`。
+- 学习率、调度、warmup、分辨率（`max_pixels`）、切块（`tiling`）以及解冻 ViT 类描述符由 runner 按 `keep_rule.yaml` 中的清单自动标为**长程敏感**（短跑结论可能不迁移到长训练；2B 与 8B 的视觉塔规模也不同），也可以手动写 `Horizon: yes`。
 
 **命令：**
 - `./run.sh`：提交当前 HEAD，**阻塞直到这次提交得到终态**（见第 6 节的状态表）。一个想法走完初筛、复现、确认，在 3 卡上大约要 40 分钟，这是正常的。
@@ -152,7 +159,7 @@ Expect: +0.8 pp 总体；chiral 切片 +2 pp
 **`./run.sh` 的输出**（进度行以 `[runner]` 开头，只是进度，不要据此做任何 git 操作；`---` 之后才是终态）：
 
 ```
-[runner] cand 7c1e2a9 "手性样本 2× 过采样" desc=stereo_x2
+[runner] cand 7c1e2a9 "手性样本 2× 过采样" desc=stereo_oversample=2
 [runner] gate ok · smoke 跳过（训练循环未改）
 [runner] screen s0: delta_pp +0.9  p=0.11 → promising，补跑种子 1、2
 [runner] replicate: delta_pp +0.7 [+0.1, +1.3]  p=0.03  seeds_pos 3/3 → dev_keep，送确认集
@@ -165,7 +172,7 @@ ci90_pp:              [+0.1, +1.3]
 p_not_better:         0.03
 seeds_pos:            3/3
 confirm:              PASS
-worst_slice:          lowres -0.5
+worst_group:          tag/lowres -0.5
 invalid_rate_pct:     0.3
 multifrag_rate_pct:   0.1
 probe_delta_pp:       -0.4
@@ -178,7 +185,7 @@ proj_cost_gpu_s:      0.21
 incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 ```
 
-你看到的数字都经过四舍五入：总分和增量到 0.1 pp，切片增量到 0.5 pp，`p_not_better` 到两位小数，CONFIRM 只有 PASS/FAIL。
+你看到的数字都经过四舍五入：总分和增量到 0.1 pp，分组增量到 0.5 pp，`p_not_better` 到两位小数，CONFIRM 只有 PASS/FAIL。
 `crash` 时打印日志尾部 50 行。
 
 ## 6. 结果状态与保留/丢弃
@@ -188,22 +195,22 @@ incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 1. **门禁**：提交只改了 `train.py`、通过静态扫描和 Bloom 过滤器、描述符是新的（或写了 `Differs-From`/`Changed`）；否则 `gate_fail`。
 2. **冒烟**（需要时）：崩溃 → 返回日志尾部，你可以用 `Fix-Of:` 修最多 2 次，之后 `crash`。
 3. **初筛 screen**：用种子 s0 训练（与在位者的 s0 共享），和在位者已存的 3 个种子做配对比较（`score.py compare`，族 × 种子层次 bootstrap）。回执无效 → `invalid`。
-4. **否决**（每一步都检查）：任一护栏 Δ < −max(下限, [2.5]·SE) → `veto:<护栏名>`。
+4. **否决**（每一步都检查；SE 是 `compare` 给出的该项配对 bootstrap 标准误）→ `veto:<护栏名>`。注意方向：
 
-   | 护栏 | 下限 |
-   |---|---|
-   | 无效结构率 `invalid` | [0.3] pp |
-   | 去盐后仍为多片段的比例 `multifrag` | [0.3] pp |
-   | 每个困难切片（≥ 300 张）：`chiral`、`abbrev`、`large`（> 50 重原子）、`lowres`（扫描/低分辨率）、`inhouse` | [1.5] pp |
-   | 300 条内部表格单元格转写探针 `probe`（防遗忘，为 S2 保住读表能力） | [2] pp |
+   | 护栏 | 方向 | 否决条件 |
+   |---|---|---|
+   | 无效结构率 `invalid` | 越低越好 | Δ > +max([0.3] pp, [2.5]·SE) |
+   | 去盐后仍为多片段的比例 `multifrag` | 越低越好 | Δ > +max([0.3] pp, [2.5]·SE) |
+   | 每个难度标签（≥ 300 张）：`chiral`、`abbrev`、`large`（> 50 重原子）、`lowres`（扫描/低分辨率）；来源切片 `inhouse` | 越高越好 | Δ < −max([1.5] pp, [2.5]·SE) |
+   | 300 条内部表格单元格转写探针 `probe`（防遗忘，为 S2 保住读表能力） | 越高越好 | Δ < −max([2] pp, [2.5]·SE) |
 
    另有固定否决：`veto:decode`、`veto:parse`（> 1% 的样本没解码完或解析失败）、`veto:cost`、`veto:rl_control`。
    金丝雀差距（100 个从未发表的分子）和扰动差距（300 张重新编码的图）只报警、不否决，但人类会看。
 5. **promising**：收缩后的 Δ ≥ +[0.5] pp 且 `p_not_better` ≤ [0.20]；否则 `discard`。
 6. **复现 replicate**：runner 并行补跑种子 s1、s2，三对三比较。平均 Δ ≥ +[0.5] pp、`p_not_better` ≤ [0.05]、三个配对增量中至少 2 个为正、否决仍然干净 → **dev_keep**；否则 `replicate_fail`。
-7. **确认 CONFIRM**：在隐藏确认集上评测这三个 adapter。平均 Δ > 0、`p_not_better` ≤ [0.10]、没有切片下降超过 max([2] pp, 2.5·SE) → PASS；否则 `confirm_fail`。你只看到一个比特。
+7. **确认 CONFIRM**：在隐藏确认集上评测这三个 adapter。平均 Δ > 0、`p_not_better` ≤ [0.10]、没有来源切片或难度标签下降超过 max([2] pp, 2.5·SE) → PASS；否则 `confirm_fail`。你只看到通过或不通过。
    当天 [10] 次额度用完 → `queued`，第二天由 runner 继续。
-8. **长程复核**：长程敏感的候选，或已经有 2 个未经 R2 复核的保留堆在一起时，runner 先在 8B 上跑 R2（约 3 小时）→ run.sh 返回 `queued`。
+8. **长程复核**：长程敏感的候选，或已经有 2 个未经 R2 复核的保留堆在一起时，runner 先在 8B 上跑 R2（约 2.6 小时，吞吐未核实）→ run.sh 返回 `queued`。
    R2 下界 < 0 → `r2_revert`。
 9. **established**：runner 把 `autoresearch/<tag>` 前移到这次提交，存下它的 3 个种子作为新基准；同一波里仍为 promising 的候选会被移到新在位者上重新初筛，移不过去的记为 `stale`。
 
@@ -225,9 +232,9 @@ incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 | `r2_revert`、`hack` | runner 事后写入 | 在位者可能被回退；从 `./run.sh --status` 显示的在位者继续 |
 
 `results.tsv` 里还有 `kind=base`（基线）和 `kind=rebase`（每天 07:00 用新种子重测在位者；如果它当初只是运气好，基准会被替换）的行。
-另外 runner 会不定期把训练卡的一部分时段用于**安慰剂**实验（不改任何东西的"候选"）、test-retest 和 Hyperband 基线，用来实测这套门槛的误保留率；这些行只在人类可见的 `results_full.tsv` 里。
+另外 runner 会把一部分训练时段用于**安慰剂**实验（不改任何东西的"候选"）、重测信度测量和 Hyperband 基线，用来实测这套门槛的误保留率。你分辨不出哪些槽位是安慰剂，也不需要分辨；这些行只记在仓库之外、只有人类可读的 `results_full.tsv` 里。
 
-**为什么这么麻烦**：这个指标的噪声比 `val_bpb` 大一个数量级以上。DEV 上一次配对比较的标准误约 0.75 pp，能可靠检出的最小提升约 1.6 pp；
+**为什么这么麻烦**：这个指标的噪声比 `val_bpb` 大一个数量级以上。DEV 上初筛（1 个新种子 vs 3 个已存种子）的标准误约 0.75 pp，复现（3 vs 3）约 0.63 pp，能可靠检出的最小提升约 1.9 pp 和 1.6 pp；
 一夜上百次初筛里挑最好的，纯噪声也能"找到"约 1–2 pp 的提升。上游社区已经多次把"换了随机种子"记成改进。
 所以初筛只决定要不要花算力复现，永远不直接推进分支；预期保留会很少，这是诚实的代价。
 
@@ -243,7 +250,7 @@ incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 | `score_pct` | 种子平均的 `val_struct`，0.1 pp |
 | `delta_pp`、`ci90_lo_pp`、`ci90_hi_pp`、`p_not_better`、`seeds_pos` | 收缩后的增量、层次 bootstrap 90% 区间、单侧 p、为正的配对种子数 |
 | `confirm` | PASS / FAIL / - |
-| `worst_slice`、`worst_slice_delta_pp` | 增量最差的切片（0.5 pp） |
+| `worst_group`、`worst_group_delta_pp` | 增量最差的来源切片或难度标签（0.5 pp） |
 | `invalid_rate_pct`、`multifrag_rate_pct`、`nostereo_f1_pct`、`probe_delta_pp`、`canary_gap_pp`、`perturb_gap_pp`、`nll` | 护栏与诊断 |
 | `train_tokens_M`、`samples_seen`、`steps`、`train_s`、`eval_s` | 预算 |
 | `decode_tok_per_item`、`proj_cost_gpu_s`、`peak_vram_gb`、`gpu_h` | 成本 |
@@ -251,8 +258,19 @@ incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 | `horizon_tag`、`descriptor`、`description` | 长程敏感标记、描述符、假设原文 |
 
 与 `score.py` 输出字段的对应：`score_pct` ← `score`（×100）；`invalid_rate_pct` ← `invalid_smiles_rate`；`multifrag_rate_pct` ← `multifragment_rate`；
-`nostereo_f1_pct` ← `struct_f1_nostereo`；`ci90_*_pp` ← `compare --alpha 0.10` 的 `delta_ci90`；切片和护栏的增量与 SE ← `compare` 的 `slice/`、`tag/`、`guardrail/` 行
-（`inhouse` 等来源是 `slice`，`chiral` 等困难子集是金标里的 `tags`）。
+`nostereo_f1_pct` ← `struct_f1_nostereo`；`ci90_*_pp` ← `compare --alpha 0.10` 的 `delta_ci90`；分组和护栏的增量与 SE ← `compare` 的 `slice/`、`tag/`、`guardrail/` 行；
+`probe_delta_pp`、`canary_gap_pp`、`perturb_gap_pp`、`nll` ← `harness/probes.py`。
+
+**错误类型**（`./run.sh --viz` 按可视化集逐条显示，由 score.py 的逐条字段算出）：
+
+| 类型 | 含义 |
+|---|---|
+| `correct` | 完全正确 |
+| `stereo_only` | 骨架对、立体错（`struct_tp = 0` 且 `struct_tp_skeleton = 1`） |
+| `invalid` | 解析不出分子 |
+| `multifrag` | 去盐后仍有多个片段 |
+| `missing` | 没有输出 |
+| `wrong_skeleton` | 其余：连接方式就不对 |
 
 `lineage.jsonl` 每次实验一行：假设、描述符、diff 摘要、父提交、种子、各项指标、数据构成、回执、状态与失败原因。
 `failed_descriptors.tsv` 以描述符为键记录已失败的想法。
@@ -271,7 +289,7 @@ incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 
 **永不停止（NEVER STOP）：** 循环开始后，不要停下来问人类"要不要继续"。人类可能在睡觉。没有想法了就更努力地想：
 用 `--viz` 挖错误类型、重读 `README.md` 第 3 节和它引用的论文、把以前的近似成功组合起来、尝试更大胆的改动。直到人类手动停止你为止。
-runner 在连续 [2] 个夜晚或 [150] 个候选没有产生 `established` 时会通知人类；人类会在"当前方针"里写一段新方向，你在下一轮第 1 步读到后照做。
+runner 在连续 [2] 个夜晚或 [150] 个候选没有产生 `established` 时发出**停滞通知**（与 S1 关口的"平台期"不是同一个阈值）；人类会在"当前方针"里写一段新方向，你在下一轮第 1 步读到后照做。
 
 需要新数据源或 harness 新功能时，写到 `requests.md`（不入库），由人类决定，然后继续做别的。
 
@@ -286,7 +304,7 @@ runner 在连续 [2] 个夜晚或 [150] 个候选没有产生 `established` 时�
 | 2 | 真实裁剪图在混合中的比例 10% / 30% / 50% | +1–4 | 真实数据比例是文献中最大的单一杠杆 |
 | 3 | 增强强度 + 由弱到强的课程 | +0.5–2 | MolParser：40.1 → 69.5 → 76.9 |
 | 4 | 标签"所见即所标"：图里画 Boc 就输出 Boc，由 harness 的固定缩写表展开 | +1–3 | MolScribe 在缩写集上 < 20%，用修正标签重训后 > 70% |
-| 5 | 手性样本 2× 过采样；楔形↔波浪键替换；装饰性楔形键作为负例 | 手性切片 +1–3 | 手性是所有系统最弱的切片 |
+| 5 | 手性样本 2× 过采样；楔形↔波浪键替换；装饰性楔形键作为负例 | `chiral` 标签 +1–3 | 强系统的手性子集明显低于总体 |
 | 6 | LoRA 目标（注意力 / gate+up / 全部线性层），rank 16–128 | ±1–2 | 只训注意力：学到 +24.9、遗忘 −0.6 |
 | 7 | `max_pixels` 384²–768²；`pad_to_square` | ±1–3，H | 每 32×32 像素一个视觉 token |
 | 8 | EMA / 检查点平均 | +0.3–1 | speedrun 衍生项目中 EMA 贡献约 63% 的收益 |
@@ -296,11 +314,11 @@ runner 在连续 [2] 个夜晚或 [150] 个候选没有产生 `established` 时�
 | 12 | 先图遍历推理、再给答案（`cot+…`） | +1–2，解码更慢 | GTR-CoT 消融 +2.3 至 +3.1 |
 | 13 | 批大小 vs 步数 | ±1 | — |
 | 14 | 语法约束解码（`grammar_id`） | 降低无效率 | — |
-| 15 | 按 InChIKey 投票，k ≤ 4 | +0.5–2，评测耗时 × k | MarkushGlyph MV@8 +1–4 |
-| 16 | `tiling: auto` 处理大分子 | `large` 切片 +3–8 | 大分子是公认短板 |
+| 15 | 按结构键投票（`decoding: vote`），k ≤ 4 | +0.5–2，评测耗时 × k | MarkushGlyph MV@8 +1–4 |
+| 16 | `tiling: auto` 处理大分子 | `large` 标签 +3–8，H | 大分子是公认短板 |
 | 17 | 随机化 SMILES 作为训练目标 | ±1 | — |
-| 18 | RL 通道：MRT，奖励 = 0.1·valid + 0.5·sim·valid + 0.4·exact | +1–5 | COMO（EditDistance 版）对比 MolScribe 的精确匹配：JPO +12.9、ACS +16.3 |
-| 19 | RL 通道：GRPO/DAPO，严格 InChIKey 奖励 + 编造立体的惩罚 | 0 至 +3 | ChemVLR 的奖励是 Tanimoto=1，对立体是盲的；MolSeek-OCR 的 GSPO 降低了精确匹配 |
+| 18 | RL 通道：MRT，奖励 = 0.1·valid + 0.5·sim·valid + 0.4·exact（与 COMO 相同；exact 用 score.py 的结构键，由 `dvlm.rewards` 提供） | +1–5 | COMO（EditDistance 版）对比 MolScribe 的精确匹配：JPO +12.9、ACS +16.3 |
+| 19 | RL 通道：GRPO/DAPO，按 score.py 结构键的二值奖励 + 编造立体的惩罚 | 0 至 +3 | ChemVLR 的奖励是 Tanimoto=1，对立体是盲的；MolSeek-OCR 的 GSPO 降低了精确匹配 |
 | 20 | 顶部几层 ViT，0.1× 学习率（慢路径） | 低 | — |
 | 21 | 选择性全参阶段（慢路径） | 不稳定 | MolSeek-OCR：直接全参发散 |
 | 22 | 只对答案计损失；标签平滑 | ≈ 0 | — |
@@ -325,7 +343,7 @@ runner 在连续 [2] 个夜晚或 [150] 个候选没有产生 `established` 时�
   | `inhouse` | 内部标注（第 3 周起） |
   | `replay` | 通用文档/表格回放 |
 
-  每条样本都带这些字段，可以用来筛选和加权：`source`、`license_track`、`family`、`is_real`、`has_stereo`、`n_heavy`、`has_abbrev`、`w0_loss`、`agreement`。
+  每条样本都带这些字段，可以用来筛选和加权：`source`、`license_track`、`family_id`、`is_real`、`has_stereo`、`n_heavy`、`has_abbrev`、`w0_loss`、`agreement`。
 - 研究轨道（非商用许可，例如 MolParser-7M、MarkushGrapher-2、MarkushGlyph）不会出现在 `dvlm.pools()` 里；任何非商用样本混进商用实验，这次实验和它的所有后代都会作废。
 - 不要试图"还原"评测分子：每条渲染样本都会和评测集的 InChIKey 第一段与 Murcko 骨架比对，命中的会被静默替换，你只会看到一个三档的拦截比例（0 / < 0.5% / ≥ 0.5%）。
 
@@ -338,4 +356,4 @@ CONFIRM 每天只回答 [10] 次、只给一个比特，并且会从储备集轮
 
 ## 当前方针（人类每天更新；与上文冲突时以这里为准）
 
-（空。人类会在这里写 2–5 句话的方向调整，例如"接下来集中在手性切片"或"停止调学习率，转向输出表示"。）
+（空。人类会在这里写 2–5 句话的方向调整，例如"接下来集中在 chiral 标签"或"停止调学习率，转向输出表示"。）
