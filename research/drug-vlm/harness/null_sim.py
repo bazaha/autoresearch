@@ -1,11 +1,17 @@
 """
 Null simulation: how often does a keep rule accept a change that does nothing?
-Compares seed-pooled vs hierarchical (family x seed) paired bootstrap in score.paired_compare.
-Usage: python null_sim.py [trials]   (120 trials: about 10 minutes on one CPU core)
+Two modes, both on score.paired_compare:
+  keep   (default) 3 vs 3 seeds, p_not_better <= 0.05: seed-pooled vs hierarchical (family x seed)
+  screen 1 new seed vs 3 stored seeds, the screen rule delta >= +0.5 pp and p_not_better <= 0.20
+Usage: python null_sim.py [trials] [screen]   (120 keep trials: about 10 minutes on one CPU core)
 Result on 2026-10-15 (120 trials per row, nominal rate 5%):
   seed SD ~0.49 pp: pooled 2.5%,  hierarchical 0.8%
   seed SD ~0.56 pp: pooled 7.5%,  hierarchical 2.5%
   seed SD ~0.70 pp: pooled 10.8%, hierarchical 1.7%
+Screen, same simulated data per row (200 trials, nominal promising rate about 20%):
+  seed logit sd 0.00: v1.7.1 19.5%, v1.8 17.5%
+  seed logit sd 0.03: v1.7.1 17.0%, v1.8 13.5%
+  seed logit sd 0.05: v1.7.1 25.0%, v1.8 14.0%   (v1.8 borrows the missing seed variance)
 """
 import os
 import sys
@@ -16,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import score
 
 N_ITEMS, CLUSTER, SEEDS = 3000, 8, 3
+SCREEN_MIN_DELTA, SCREEN_MAX_P = 0.005, 0.20
 
 def make_run(rng, difficulty, seed_effect):
     p = 1 / (1 + np.exp(-(difficulty + seed_effect)))
@@ -25,19 +32,34 @@ def make_run(rng, difficulty, seed_effect):
              "n_invalid_struct": 0, "n_multifrag_struct": 0,
              "record_tp": 0, "n_pred_rec": 0, "n_gold_rec": 0, "n_orphan_rec": 0} for i, c in enumerate(correct)]
 
-def trial(rng, seed_sd_logit):
+def _runs(rng, seed_sd_logit, n_new):
     score.BOOTSTRAP_SAMPLES = 300   # enough for a 5% decision; set here, not at import time
     fam = rng.normal(0, 0.8, N_ITEMS // CLUSTER).repeat(CLUSTER)
     difficulty = 1.4 + fam + rng.normal(0, 1.5, N_ITEMS)        # ~0.75 accuracy, clustered
     base = [make_run(rng, difficulty, rng.normal(0, seed_sd_logit)) for _ in range(SEEDS)]
-    new = [make_run(rng, difficulty, rng.normal(0, seed_sd_logit)) for _ in range(SEEDS)]  # same recipe: null
+    new = [make_run(rng, difficulty, rng.normal(0, seed_sd_logit)) for _ in range(n_new)]  # same recipe: null
+    return base, new
+
+def trial(rng, seed_sd_logit):
+    base, new = _runs(rng, seed_sd_logit, SEEDS)
     pooled = score.paired_compare(score.pool_seeds(base), score.pool_seeds(new))
     hier = score.paired_compare(base, new)
     return pooled["p_not_better"] <= 0.05, hier["p_not_better"] <= 0.05, hier["base_seed_scores"]
 
-def main(trials=120):
+def screen_trial(rng, seed_sd_logit):
+    base, new = _runs(rng, seed_sd_logit, 1)
+    r = score.paired_compare(base, new[0])
+    return r["delta"] >= SCREEN_MIN_DELTA and r["p_not_better"] <= SCREEN_MAX_P, r["base_seed_scores"]
+
+def main(trials=120, mode="keep"):
     for sd in (0.0, 0.03, 0.05):
         rng = np.random.default_rng(int(sd * 1000))
+        if mode == "screen":
+            res = [screen_trial(rng, sd) for _ in range(trials)]
+            spread = np.mean([np.std(r[1]) for r in res])
+            print(f"seed logit sd={sd:.2f} (~{100*spread:.2f} pp seed SD): "
+                  f"placebo promising rate={np.mean([r[0] for r in res]):.3f}")
+            continue
         res = [trial(rng, sd) for _ in range(trials)]
         spread = np.mean([np.std(r[2]) for r in res])
         print(f"seed logit sd={sd:.2f} (~{100*spread:.2f} pp seed SD): "
@@ -45,4 +67,4 @@ def main(trials=120):
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 120)
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 120, sys.argv[2] if len(sys.argv) > 2 else "keep")

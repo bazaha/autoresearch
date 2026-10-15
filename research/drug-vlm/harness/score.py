@@ -19,17 +19,17 @@ Gold and predictions are JSONL files, one document (a page, a crop, or a patent)
 `family_id` (patent family / article; a paper and its SI share one) is the bootstrap cluster
 and defaults to doc_id; `slice` (gold only) is the source, used for per-slice reporting and
 slice weighting; `doc_type` (gold only: patent / paper / si) can replace it as the grouping
-(--group-field doc_type, the S2 macro-average); `tags` (gold only, optional list such as
-["chiral", "abbrev", "large", "lowres"]) marks difficulty subsets that are reported separately
-(a document may carry several). An OCSR crop is simply a document with compounds and no
-measurements; there a missing answer costs what a wrong one costs. A value given as [lo, hi] is a
-range; value strings such as ">10", "10–30", "12 ± 3", "1.2 × 10⁻⁵", "10 µM" (unit inside the
-value) and "n.d." are parsed, and a unit missing from `unit` is taken from the value string or
-from the endpoint header ("IC50 (µM)", "Papp (10⁻⁶ cm/s)"). Compound units (mL/min/kg vs
-L/h/kg, ng·h/mL vs µg·h/mL) are compared by dimension. Record key v2: the optional context
-fields assay_type, species, matrix (or cell_line), variant, ph, dose/dose_unit and route --
-also recognized in the header ("CLint (HLM)", "logD7.4") -- count only where the gold fills
-them. Labels keep Latin, Greek and Chinese characters ("PI3Kα", "抑制率").
+(--group-field doc_type, the S2 macro-average; gold `office` and `language` work the same way);
+`tags` (gold only, optional list such as ["chiral", "abbrev", "large", "lowres"]) marks
+difficulty subsets that are reported separately (a document may carry several). An OCSR crop
+is simply a document with compounds and no measurements; there a missing answer costs what a
+wrong one costs. A value given as [lo, hi] is a range; value strings such as ">10", "10–30",
+"12 ± 3", "1.2 × 10⁻⁵", "10 µM" (unit inside the value) and "n.d." are parsed, and a unit
+missing from `unit` is taken from the value string or from the endpoint header ("IC50 (µM)",
+"Papp (10⁻⁶ cm/s)"). Compound units (mL/min/kg vs L/h/kg, ng·h/mL vs µg·h/mL) are compared
+by dimension. Record key v2: the optional context fields assay_type, species, matrix (or
+cell_line), variant, ph, dose/dose_unit, route and time/time_unit -- also recognized in the
+header ("CLint (HLM)", "logD7.4") -- count only where the gold fills them. Labels keep Latin, Greek and Chinese characters ("PI3Kα", "抑制率").
 
 Structures are SMILES/CXSMILES. Markush/R-group positions are dummy atoms written as
 `[1*]`, `[*:1]` or a CXSMILES label (`*... |$R1$|`, `_R1`); all four mean R1. Racemic or
@@ -71,13 +71,14 @@ RDLogger.DisableLog("rdApp.*")
 # Constants (fixed, do not modify — changing these changes the metric)
 # ---------------------------------------------------------------------------
 
+SCORER_VERSION = "1.8"  # printed with every score; see harness/README.md section 7
 RDKIT_PIN = "2026.09.1"  # canonicalization changes between RDKit releases; scores are only comparable on one version
 W_STRUCT = 0.5          # weight of structure F1 in the composite score
 W_RECORD = 0.5          # weight of record F1 (structure + value correctly linked)
 VALUE_REL_TOL = 1e-3    # relative tolerance when gold and prediction use the same scale
 # When exactly one side was converted (pX or mass -> molar), the prediction must fall inside
 # the rounding interval of the gold value as printed (half a unit in its last digit).
-STRIP_SALTS = True      # compare parent compounds (largest fragment, neutralized)
+STRIP_SALTS = True      # remove listed counterions/solvents (other fragments stay), neutralize
 MATCH_TARGET = True     # a record must also name the right target
 MAX_HEAVY_ATOMS = 500   # larger predicted structures are invalid (keeps scoring time bounded)
 MAX_SMILES_CHARS = 5000 # longer strings are invalid before RDKit sees them (runaway output can crash it)
@@ -931,7 +932,7 @@ def normalize_measurement(m, mw=None):
     concentration of single-dose endpoints such as % inhibition, given as conc/conc_unit or
     written in the endpoint ('% inh @ 1 µM'). An empty unit field falls back to a unit written
     in the value ('10 µM') or in the header ('IC50 (µM)', 'Papp (10⁻⁶ cm/s)'). `context` holds
-    the record-key-v2 fields (assay_type, species, matrix, variant, ph, dose, route), also
+    the record-key-v2 fields (assay_type, species, matrix, variant, ph, dose, route, time), also
     when written in the header ('CLint (HLM)', 'logD7.4'); they count only where the gold has them.
     """
     if any(len(str(m.get(f) or "")) > MAX_FIELD_CHARS for f in ("unit", "endpoint", "target", "relation", "conc", "conc_unit")):
@@ -990,6 +991,7 @@ def normalize_measurement(m, mw=None):
 # Per-document scoring
 # ---------------------------------------------------------------------------
 
+_LABEL_LIST = re.compile(r"[;；、]")
 _LABEL_PREFIX = re.compile(r"^(?:compound|cpd|example|ex|化合物|实施例|實施例|実施例)(?:\.\s*|\s+|(?=\d))")
 
 
@@ -997,8 +999,11 @@ def _norm_label(s):
     """
     'Compound 12a' / 'cpd. 12a' / 'Ex. 12a' / '12 a' -> '12a'. A separator between two digits
     is kept ('1-11' != '11-1' != '111'); a word that merely starts with 'ex' is not a prefix.
+    A list of labels ('1;2', '12a、12b') is not a label: it links to nothing.
     """
     if not isinstance(s, (str, int, float)) or isinstance(s, bool):
+        return ""
+    if isinstance(s, str) and _LABEL_LIST.search(s):
         return ""
     s = _LABEL_PREFIX.sub("", _nfkc(s).casefold().strip()).translate({0x2032: "'", 0x2033: "''", 0x2019: "'"})
     s = re.sub(r"(?<=\d)[^0-9a-z'\u3400-\u9fff]+(?=\d)", "§", s)
@@ -1228,6 +1233,7 @@ def score_document(gold, pred):
         "slice": gold.get("slice") or "all",
         "doc_type": gold.get("doc_type") or "",
         "tags": sorted(set(gold.get("tags") or [])),
+        **{f: str(gold[f]) for f in _GROUP_FIELDS if isinstance(gold.get(f), (str, int)) and gold.get(f) != ""},
         "n_gold_unscorable": n_gold_unscorable,
         "struct_tp": struct_tp,
         "struct_tp_skeleton": _multiset_tp([s for _, s in g_valid], [s for _, s in p_valid]),
@@ -1254,7 +1260,9 @@ def score_document(gold, pred):
 # Aggregation, composite score, bootstrap
 # ---------------------------------------------------------------------------
 
-_ID_FIELDS = ("doc_id", "family_id", "slice", "doc_type", "tags", "gold")
+# Optional gold fields copied into the per-document rows so that --group-field can use them.
+_GROUP_FIELDS = ("office", "language")
+_ID_FIELDS = ("doc_id", "family_id", "slice", "doc_type", "tags", "gold") + _GROUP_FIELDS
 SCALARS = ("auto", "composite", "struct_f1", "record_f1")
 # Guardrail rates reported with paired deltas and bootstrap SEs by `compare` (numerator, denominator).
 GUARDRAILS = {"invalid_smiles_rate": ("n_invalid_struct", "n_pred_struct_raw"),
@@ -1454,6 +1462,11 @@ def regroup(per_doc, field="slice"):
     """Use another gold field (e.g. doc_type for the S2 macro-average) as the grouping `slice`."""
     if field == "slice":
         return per_doc
+    if field not in ("doc_type",) + _GROUP_FIELDS:
+        raise ValueError(f"--group-field {field}: not a groupable field "
+                         f"(use slice, doc_type, {', '.join(_GROUP_FIELDS)}, or put it in tags)")
+    if per_doc and not any(d.get(field) for d in per_doc):
+        raise ValueError(f"--group-field {field}: no gold document has this field")
     return [dict(d, slice=str(d.get(field) or "all")) for d in per_doc]
 
 
@@ -1480,8 +1493,10 @@ def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None, req
     of seed runs each, scored against the same gold (checked through the per-doc `gold` hash
     and the doc_id sets unless require_same_docs=False, which pairs on the shared doc_ids).
     Every bootstrap replicate resamples whole families within slice strata (shared by both
-    sides, which is the pairing) and, separately for each side, its seeds; with one seed per
-    side, seed variance cannot enter and the result is only a screen. Also returns paired
+    sides, which is the pairing) and, separately for each side, its seeds. With one seed on
+    one side only (the 1-vs-3 screen) that side's seed variance is borrowed from the other
+    side's between-seed spread; with one seed per side, seed variance cannot enter at all and
+    the result is only a rough screen. Also returns paired
     deltas with bootstrap SEs for every slice scalar and guardrail rate, and for every
     difficulty tag (gold `tags`, several per document), so that vetoes can be scaled to their
     own noise. Guardrail rates are lower-is-better: veto if delta > +k * se; slices and tags
@@ -1511,9 +1526,26 @@ def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None, req
     base_rep = _slice_totals(base_m, order, w, base_k)
     new_rep = _slice_totals(new_m, order, w, new_k)
     base_pt, new_pt = _slice_totals(base_m, order), _slice_totals(new_m, order)
+    # A one-seed side (the 1-vs-3 screen) carries no seed variance of its own: borrow it from the
+    # other side's between-seed spread, one normal draw per replicate shared by every quantity.
+    # Without this the screen's SE is too small and placebos pass it too often.
+    nb, nn = len(base_runs), len(new_runs)
+    multi = new_m if nb == 1 < nn else base_m if nn == 1 < nb else None
+    z = rng.standard_normal(BOOTSTRAP_SAMPLES) if multi is not None else None
 
-    deltas = _primary(new_rep, mode, slice_weights) - _primary(base_rep, mode, slice_weights)
-    paired = lambda f: (float(f(new_pt) - f(base_pt)), float(np.std(f(new_rep) - f(base_rep), ddof=1)))
+    def jitter(f, mats=None):
+        """Seed noise for the one-seed side of quantity f (0 when both sides have seeds)."""
+        if z is None:
+            return 0.0
+        mats = multi if mats is None else mats
+        n = next(iter(mats.values())).shape[0]
+        vals = [float(f(_slice_totals({k: m[[i]] for k, m in mats.items()}, order))) for i in range(n)]
+        sd = float(np.std(vals, ddof=1))
+        return z * sd if math.isfinite(sd) else 0.0
+
+    primary = lambda t: _primary(t, mode, slice_weights)
+    deltas = primary(new_rep) - primary(base_rep) + jitter(primary)
+    paired = lambda f: (float(f(new_pt) - f(base_pt)), float(np.std(f(new_rep) - f(base_rep) + jitter(f), ddof=1)))
     guards = {g: paired(lambda t, num=num, den=den: _guard_value(t, num, den)) for g, (num, den) in GUARDRAILS.items()}
     slices = {s: paired(lambda t, s=s: _scalar_from(t[s], mode)) for s in base_pt}
     tags = {}
@@ -1527,6 +1559,8 @@ def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None, req
         whole = lambda tot: _scalar_from({f: sum(t[f] for t in tot.values()) for f in next(iter(tot.values()))}, mode)
         pt = whole(_slice_totals(tn, order)) - whole(_slice_totals(tb, order))
         rep_d = whole(_slice_totals(tn, order, w, new_k)) - whole(_slice_totals(tb, order, w, base_k))
+        if z is not None:
+            rep_d = rep_d + jitter(whole, tn if nn > 1 else tb)
         tags[tag] = (float(pt), float(np.std(rep_d, ddof=1)))
     seed_scores = lambda runs: [round(aggregate(r, mode, slice_weights)["score"], 6) for r in runs]
     return {"delta": float(_primary(new_pt, mode, slice_weights) - _primary(base_pt, mode, slice_weights)),
@@ -1572,6 +1606,22 @@ def _read_jsonl(path, strict=True):
     return rows, bad
 
 
+def _check_pred_schema(pred_rows):
+    """
+    A prediction file whose records cannot reach any compound is a format error, not a score:
+    without this, a converter that writes `compound` instead of `compound_id` scores record F1 = 0
+    with no warning.
+    """
+    ms = [m for d in pred_rows if isinstance(d.get("measurements"), list)
+          for m in d["measurements"] if isinstance(m, dict)]
+    if ms and not any("compound_id" in m for m in ms):
+        hint = " (found key 'compound': convert records_yaml_v1 with yaml_to_jsonl.py)" if any("compound" in m for m in ms) else ""
+        raise ValueError(f"schema mismatch: none of the {len(ms)} predicted measurements has compound_id{hint}")
+    cs = [c for d in pred_rows if isinstance(d.get("compounds"), list) for c in d["compounds"] if isinstance(c, dict)]
+    if cs and not any("smiles" in c for c in cs):
+        raise ValueError(f"schema mismatch: none of the {len(cs)} predicted compounds has smiles")
+
+
 def score_files(gold_path, pred_path):
     """Every gold document is scored; a missing or unparseable prediction counts as empty."""
     gold, _ = _read_jsonl(gold_path)
@@ -1579,6 +1629,7 @@ def score_files(gold_path, pred_path):
     pred = {}
     for d in pred_rows:
         pred.setdefault(d.get("doc_id"), d)  # first prediction wins: no best-of-N
+    _check_pred_schema(pred_rows)
     missing = sum(1 for g in gold if g.get("doc_id") not in pred)
     if missing or n_bad:
         print(f"warning: {missing} gold documents without prediction, {n_bad} unparseable lines", file=sys.stderr)
@@ -1648,6 +1699,7 @@ def main():
         _line("missing_pred_docs", n_missing)
         _line("rdkit_version", RDKIT_VERSION)
         _line("gold_sha256", gold_hash)
+        _line("scorer_version", SCORER_VERSION)
         _line("scorer_sha256", _sha256(os.path.abspath(__file__)))
         mode = resolve_scalar(per_doc, args.scalar)
         slices = sorted({d["slice"] for d in per_doc})

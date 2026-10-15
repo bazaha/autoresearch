@@ -667,6 +667,62 @@ class ExploitTests(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class LabelListTests(unittest.TestCase):
+    def test_a_list_of_labels_links_to_nothing(self):
+        for raw in ("1;2", "12a；12b", "化合物1、2"):
+            self.assertEqual(score._norm_label(raw), "", raw)
+        self.assertEqual(score._norm_label("Example 1-2"), "1-2")
+        gold = doc([{"id": "1-2", "smiles": ASPIRIN}], [meas("1-2", 12.3)])
+        pred = doc([{"id": "1-2", "smiles": ASPIRIN}], [meas("1;2", 12.3)])
+        self.assertEqual(score.score_document(gold, pred)["record_tp"], 0)
+
+
+class ConverterTests(unittest.TestCase):
+    TABLE = """
+table: {doc_id: "EXAMPLE-PAPER-1", page: 5, table_id: "T2"}
+scaffold: {cxsmiles: "O=C(Nc1ccc([*:1])cc1)c1ccncc1"}
+rgroups:
+  - {compound_id: "12a", R1: "[H]"}
+  - {compound_id: "12b", R1: "F"}
+  - {compound_id: "12c", R1: "OMe"}
+legend: {"A": "<10 nM"}
+records:
+  - {compound_id: "12a", endpoint: "IC50", target: "EGFR", value: "12.30", unit: "nM"}
+  - {compound_id: "12a", endpoint: "IC50", target: "", cell_line: "HCT116", value: ">10", unit: "µM"}
+  - {compound_id: "12c", endpoint: "IC50", target: "EGFR", value: "A", footnote: "*"}
+---
+table: {doc_id: "EXAMPLE-PAPER-1", page: 6, table_id: "T3"}
+scaffold: {cxsmiles: "*c1ccc(*)cc1 |$_R1;;;;;X;;$|"}
+rgroups:
+  - {compound_id: "20", R1: "CF3", X: "Cl"}
+  - {compound_id: "21", R1: "Xyz", X: "Cl"}
+"""
+
+    def test_records_yaml_converts_and_scores(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        import yaml_to_jsonl
+        warnings = []
+        docs = yaml_to_jsonl.convert(list(yaml.load_all(self.TABLE, Loader=yaml.BaseLoader)), warn=warnings.append)
+        self.assertEqual(len(docs), 1)
+        smiles = {c["id"]: c["smiles"] for c in docs[0]["compounds"]}
+        self.assertEqual(score.structure_key(smiles["12c"]), score.structure_key("COc1ccc(NC(=O)c2ccncc2)cc1"))
+        self.assertEqual(score.structure_key(smiles["12a"]), score.structure_key("O=C(Nc1ccccc1)c1ccncc1"))
+        self.assertEqual(score.structure_key(smiles["20"]), score.structure_key("FC(F)(F)c1ccc(Cl)cc1"))
+        self.assertIsNone(smiles["21"])
+        self.assertTrue(any("21" in w for w in warnings))
+        self.assertEqual(docs[0]["measurements"][0]["value"], "12.30")   # printed form kept
+        self.assertEqual(docs[0]["measurements"][2]["bin"], "<10 nM")
+        gold = doc([{"id": "12a", "smiles": "O=C(Nc1ccccc1)c1ccncc1"},
+                    {"id": "12c", "smiles": "COc1ccc(NC(=O)c2ccncc2)cc1"}],
+                   [meas("12a", "12.30"), dict(meas("12a", ">10", unit="µM", target=""), cell_line="HCT116"),
+                    dict(meas("12c", "A", unit=""))], doc_id="EXAMPLE-PAPER-1")
+        s = score.aggregate([score.score_document(gold, docs[0])])
+        self.assertEqual(s["record_f1"], 1.0)
+
+
 class FileScoringTests(unittest.TestCase):
     def test_bad_prediction_lines_and_missing_docs_score_as_empty(self):
         import json, os, tempfile
@@ -684,6 +740,35 @@ class FileScoringTests(unittest.TestCase):
         self.assertAlmostEqual(score.aggregate(per_doc)["struct_recall"], 1 / 3)
         # crops: a missing answer costs what a wrong one costs, so precision drops too
         self.assertAlmostEqual(score.aggregate(per_doc)["struct_precision"], 1 / 3)
+
+
+    def test_prediction_without_compound_id_is_a_format_error(self):
+        import json, os, tempfile
+        gold = doc([{"id": "12a", "smiles": ASPIRIN}], [meas("12a", 12.3)])
+        bad = {"doc_id": "d1", "compounds": [{"id": "12a", "smiles": ASPIRIN}],
+               "measurements": [{"compound": "12a", "value": 12.3, "unit": "nM", "endpoint": "IC50", "target": "EGFR"}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            gold_path, pred_path = os.path.join(tmp, "gold.jsonl"), os.path.join(tmp, "pred.jsonl")
+            with open(gold_path, "w") as f:
+                f.write(json.dumps(gold) + "\n")
+            with open(pred_path, "w") as f:
+                f.write(json.dumps(bad) + "\n")
+            with self.assertRaisesRegex(ValueError, "compound_id.*yaml_to_jsonl"):
+                score.score_files(gold_path, pred_path)
+            with open(pred_path, "w") as f:
+                f.write(json.dumps(doc([{"id": "12a", "smiles": ASPIRIN}], [meas("12a", 12.3)])) + "\n")
+            per_doc, _ = score.score_files(gold_path, pred_path)
+        self.assertEqual(score.aggregate(per_doc)["record_f1"], 1.0)
+
+    def test_group_field_office_is_carried_and_unknown_fields_fail(self):
+        rows = [score.score_document(dict(doc([{"smiles": ASPIRIN}], doc_id=f"d{i}"), office=off), doc([{"smiles": ASPIRIN}], doc_id=f"d{i}"))
+                for i, off in enumerate(["CN", "CN", "US"])]
+        self.assertEqual(sorted(d["slice"] for d in score.regroup(rows, "office")), ["CN", "CN", "US"])
+        self.assertEqual(score.aggregate(score.regroup(rows, "office"))["n_docs"], 3)   # office is not a count
+        with self.assertRaisesRegex(ValueError, "no gold document"):
+            score.regroup(rows, "language")
+        with self.assertRaisesRegex(ValueError, "not a groupable field"):
+            score.regroup(rows, "jurisdiction")
 
 
 class StatisticsTests(unittest.TestCase):
@@ -831,12 +916,23 @@ class StatisticsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             score.paired_compare(tagged(a, "aaa"), tagged(a, "bbb"))
 
+    def test_one_seed_side_borrows_seed_variance(self):
+        # Three stored seeds that disagree a lot (accuracy 0.5 / 0.7 / 0.9) against one new seed:
+        # the interval must reflect that seed spread, not only the document resampling.
+        base = [self._per_doc(n, 200) for n in (100, 140, 180)]
+        new = self._per_doc(140, 200)
+        screen = score.paired_compare(base, new)
+        self.assertGreater(screen["ci_hi"] - screen["ci_lo"], 0.3)   # ~2 x 1.645 x 0.2
+        same = score.paired_compare(base, base)
+        self.assertEqual(same["delta"], 0.0)
+
     def test_null_simulation_runs_against_this_scorer(self):
         import numpy as np
         import null_sim
         saved = score.BOOTSTRAP_SAMPLES
         try:
             pooled, hier, seeds = null_sim.trial(np.random.default_rng(0), 0.03)
+            promising, _ = null_sim.screen_trial(np.random.default_rng(0), 0.03)
         finally:
             score.BOOTSTRAP_SAMPLES = saved
         self.assertEqual(len(seeds), null_sim.SEEDS)
