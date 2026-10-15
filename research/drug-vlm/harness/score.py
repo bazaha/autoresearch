@@ -38,7 +38,7 @@ from functools import lru_cache
 
 import numpy as np
 from rdkit import Chem, DataStructs, RDLogger, __version__ as RDKIT_VERSION
-from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem import Descriptors, rdFingerprintGenerator
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
 RDLogger.DisableLog("rdApp.*")
@@ -67,6 +67,13 @@ BOOTSTRAP_SEED = 0
 _morgan = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 _uncharger = rdMolStandardize.Uncharger()
 _salt_remover = rdMolStandardize.FragmentRemover()
+# Coordination complexes are keyed as drawn (standard InChI): salt stripping and RDKit's
+# metal disconnection would reduce cisplatin to ammonia. Alkali/alkaline-earth ions stay salts.
+_COMPLEX_METALS = {
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
+    "Pd", "Ag", "Cd", "La", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Al", "Ga", "In", "Sn",
+    "Tl", "Pb", "Bi", "Sb", "Ce", "Gd", "Lu",
+}
 _GENERIC_LABELS = {"X": 90, "Y": 91, "Z": 92, "A": 93, "Ar": 94, "Het": 95, "Alk": 96, "Q": 97, "G": 98}
 _DUMMY_PROPS = ("atomLabel", "dummyLabel", "_MolFileRLabel")
 
@@ -114,7 +121,9 @@ def _standardize(smiles):
         mol = mol.GetMol()
         if _is_markush(mol):
             return mol if mol.GetNumHeavyAtoms() <= MAX_HEAVY_ATOMS else None
-        if STRIP_SALTS:
+        if any(atom.GetSymbol() in _COMPLEX_METALS for atom in mol.GetAtoms()):
+            pass  # keyed as drawn
+        elif STRIP_SALTS:
             mol = rdMolStandardize.FragmentParent(mol)
             mol = _uncharger.uncharge(mol)
         else:
@@ -210,16 +219,28 @@ def tanimoto(smiles_a, smiles_b):
         return 0.0
     return DataStructs.TanimotoSimilarity(fa, fb)
 
+
+@lru_cache(maxsize=200_000)
+def mol_weight(smiles):
+    """Average MW of the standardized parent (g/mol), used to convert mass concentrations."""
+    mol = _standardize(smiles)
+    return None if mol is None or _is_markush(mol) else Descriptors.MolWt(mol)
+
 # ---------------------------------------------------------------------------
 # Measurement normalization
 # ---------------------------------------------------------------------------
 
-_SUBSCRIPTS = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
-_MOLAR_TO_NM = {"pm": 1e-3, "nm": 1.0, "um": 1e3, "mm": 1e6, "m": 1e9}
+_SUBSCRIPTS = str.maketrans({**dict(zip("₀₁₂₃₄₅₆₇₈₉ₐₑₒₓₕₖₗₘₙₚₛₜᵢ", "0123456789aeoxhklmnpsti")), "½": "1/2"})
+_MOLAR_TO_NM = {"pm": 1e-3, "nm": 1.0, "um": 1e3, "mm": 1e6, "m": 1e9,
+                "pmol/l": 1e-3, "nmol/l": 1.0, "umol/l": 1e3, "mmol/l": 1e6, "mol/l": 1e9}
+_MASS_TO_G_PER_L = {"g/l": 1.0, "mg/ml": 1.0, "ug/ml": 1e-3, "ng/ml": 1e-6, "pg/ml": 1e-9,
+                    "mg/l": 1e-3, "ug/l": 1e-6, "ng/l": 1e-9}
+_PX_UNITS = {"", "m", "log", "logm", "logunit", "logunits"}
 _TIME_TO_H = {"s": 1 / 3600, "sec": 1 / 3600, "min": 1 / 60, "mins": 1 / 60, "minutes": 1 / 60,
               "h": 1.0, "hr": 1.0, "hrs": 1.0, "hours": 1.0, "d": 24.0, "days": 24.0}
 _P_ENDPOINTS = {"pic50": "ic50", "pki": "ki", "pkd": "kd", "pec50": "ec50", "pgi50": "gi50"}
-_ENDPOINT_SYNONYMS = {"inhibition": "%inhibition", "%inh": "%inhibition", "inhibition%": "%inhibition"}
+_ENDPOINT_SYNONYMS = {"inhibition": "%inhibition", "%inh": "%inhibition", "inhibition%": "%inhibition",
+                      "%inhibition": "%inhibition", "t12": "t1/2", "halflife": "t1/2", "thalf": "t1/2"}
 _RELATIONS = {"": "=", "=": "=", "==": "=", "~": "=", "≈": "=", "<": "<", "<=": "<", "≤": "<",
               ">": ">", ">=": ">", "≥": ">", "range": "range"}
 _FLIP = {"=": "=", "<": ">", ">": "<", "range": "range"}
@@ -230,9 +251,12 @@ def _norm_text(s):
     return re.sub(r"[^0-9a-z%]+", "", s)
 
 
+_AT_CONC = re.compile(r"(?:@|\bat\b)\s*([0-9]*\.?[0-9]+)\s*([a-zA-Zµμ]+(?:/[a-zA-Z]+)?)")
+
+
 def _norm_endpoint(s):
     """'IC₅₀ (µM)' -> 'ic50': units written inside the endpoint name are dropped."""
-    e = _norm_text(re.sub(r"\(.*?\)|\[.*?\]", "", str(s or "")))
+    e = _norm_text(re.sub(r"\(.*?\)|\[.*?\]|" + _AT_CONC.pattern, "", str(s or "")))
     return _ENDPOINT_SYNONYMS.get(e, e)
 
 
@@ -249,51 +273,95 @@ def _norm_unit(s):
     return ".".join(num) + "".join("/" + t for t in den)
 
 
-def _to_canonical(value, unit):
-    """(value, unit) -> (unit_class, value in canonical unit)."""
+def _to_canonical(value, unit, mw=None):
+    """(value, unit) -> (unit_class, value in canonical unit, converted_via_mw)."""
     u = _norm_unit(unit)
     if u in _MOLAR_TO_NM:
-        return "molar", value * _MOLAR_TO_NM[u]
+        return "molar", value * _MOLAR_TO_NM[u], False
+    if u in _MASS_TO_G_PER_L and mw:
+        return "molar", value * _MASS_TO_G_PER_L[u] / mw * 1e9, True
     if u in _TIME_TO_H:
-        return "time", value * _TIME_TO_H[u]
-    return "unit:" + u, value
+        return "time", value * _TIME_TO_H[u], False
+    return "unit:" + u, value, False
 
 
-def normalize_measurement(m):
+_NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?"
+_RANGE = re.compile(rf"^({_NUM})\s*(?:-|–|—|to)\s*({_NUM})$", re.I)
+_PREFIX = re.compile(r"^(<=|>=|≤|≥|<|>|~|≈|=)\s*")
+
+
+def _parse_value(raw, relation):
     """
-    -> (endpoint, target, relation, unit_class, condition, values, from_p), or None if the
-    value is not numeric. `values` is one number, or (lo, hi) for a range, in a canonical
-    unit: molar concentrations in nM, times in hours; p-values (pIC50 etc.) are converted
-    to nM with the relation flipped and `from_p` set, so that a pX printed in the paper and
-    a molar value converted by the model can still match within rounding. `condition` is
-    the test concentration of single-dose endpoints such as % inhibition.
+    -> (numbers tuple, relation, category). Accepts numbers, [lo, hi], and strings such as
+    '1,200', '>10', '10-30', '10 to 30'. Anything else non-empty ('NT', 'inactive', a
+    binned 'A' or '+++') is a categorical value compared as normalized text.
     """
-    raw = m.get("value")
-    try:
-        values = tuple(float(v) for v in raw) if isinstance(raw, (list, tuple)) else (float(raw),)
-    except (TypeError, ValueError):
+    if isinstance(raw, bool) or raw is None:
         return None
-    if not values or len(values) > 2 or not all(math.isfinite(v) for v in values):
+    if isinstance(raw, (int, float)):
+        return (float(raw),), relation, None
+    if isinstance(raw, (list, tuple)):
+        try:
+            return tuple(float(v) for v in raw), relation, None
+        except (TypeError, ValueError):
+            return None
+    s = str(raw).strip().replace("−", "-").replace(",", "")
+    m = _PREFIX.match(s)
+    if m:
+        relation, s = (m.group(1) if relation in ("", "=") else relation), s[m.end():]
+    r = _RANGE.match(s)
+    if r:
+        return (float(r.group(1)), float(r.group(2))), relation, None
+    try:
+        return (float(s),), relation, None
+    except ValueError:
+        token = re.sub(r"[^0-9a-z+\-]+", "", s.casefold())
+        return ((), relation, token) if token else None
+
+
+def normalize_measurement(m, mw=None):
+    """
+    -> (endpoint, target, relation, unit_class, condition, values, converted), or None if
+    there is no value. `values` is one number, (lo, hi) for a range, or () for a categorical
+    value (whose text then sits in `relation`), in a canonical unit: molar concentrations in
+    nM, times in hours. p-values (pIC50 etc.) are converted to nM with the relation flipped,
+    and mass concentrations (µg/mL) to nM using `mw`, the record's structure; `converted`
+    marks both, so that the printed and a converted form can still match within rounding.
+    `condition` is the test concentration of single-dose endpoints such as % inhibition,
+    given as conc/conc_unit or written in the endpoint ('% inh @ 1 µM').
+    """
+    parsed = _parse_value(m.get("value"), str(m.get("relation") or "").strip())
+    if parsed is None:
+        return None
+    values, relation, category = parsed
+    if len(values) > 2 or not all(math.isfinite(v) for v in values):
         return None
     endpoint = _norm_endpoint(m.get("endpoint"))
     target = _norm_text(m.get("target")) if MATCH_TARGET else ""
-    relation = "range" if len(values) == 2 else _RELATIONS.get(str(m.get("relation") or "").strip(), "?")
-    from_p = endpoint in _P_ENDPOINTS and _norm_unit(m.get("unit")) == ""
-    if from_p:
-        endpoint, unit_class = _P_ENDPOINTS[endpoint], "molar"
+    relation = "range" if len(values) == 2 else _RELATIONS.get(relation, "?")
+    converted = False
+    if category is not None:
+        relation, unit_class = "cat:" + category, ""
+    elif endpoint in _P_ENDPOINTS and _norm_unit(m.get("unit")) in _PX_UNITS:
+        endpoint, unit_class, converted = _P_ENDPOINTS[endpoint], "molar", True
         values, relation = tuple(10.0 ** (9.0 - v) for v in values), _FLIP.get(relation, relation)
     else:
-        converted = [_to_canonical(v, m.get("unit")) for v in values]
-        unit_class, values = converted[0][0], tuple(v for _, v in converted)
+        canon = [_to_canonical(v, m.get("unit"), mw) for v in values]
+        unit_class, values, converted = canon[0][0], tuple(v for _, v, _ in canon), canon[0][2]
     values = tuple(sorted(values))
+    conc, conc_unit = m.get("conc"), m.get("conc_unit")
+    if conc is None:
+        at = _AT_CONC.search(str(m.get("endpoint") or ""))
+        if at:
+            conc, conc_unit = at.group(1), at.group(2)
     condition = ""
-    if m.get("conc") is not None:
+    if conc is not None:
         try:
-            cls, cval = _to_canonical(float(m["conc"]), m.get("conc_unit"))
+            cls, cval, _ = _to_canonical(float(conc), conc_unit)
             condition = f"{cls}:{cval:.4g}"
         except (TypeError, ValueError):
             condition = "?"
-    return endpoint, target, relation, unit_class, condition, values, from_p
+    return endpoint, target, relation, unit_class, condition, values, converted
 
 # ---------------------------------------------------------------------------
 # Per-document scoring
@@ -330,11 +398,11 @@ def _multiset_tp(gold_keys, pred_keys):
 
 
 def _records(measurements, table, by_label):
-    """Measurements -> list of (key_tuple, (values, from_p)). Unresolvable records keep key None."""
+    """Measurements -> list of (key_tuple, (values, converted)). Unresolvable records keep key None."""
     out = []
     for m in measurements:
-        norm = normalize_measurement(m)
         cid = _norm_label(m.get("compound_id"))
+        norm = normalize_measurement(m, mol_weight(table[cid]) if cid in table else None)
         if by_label:
             ckey = cid or None
         else:
@@ -342,8 +410,8 @@ def _records(measurements, table, by_label):
         if norm is None or ckey is None:
             out.append((None, None))
             continue
-        *fields, values, from_p = norm
-        out.append(((ckey, *fields), (values, from_p)))
+        *fields, values, converted = norm
+        out.append(((ckey, *fields), (values, converted)))
     return out
 
 
@@ -351,7 +419,7 @@ def _close(gold, pred):
     (gv, gp), (pv, pp) = gold, pred
     if len(gv) != len(pv):
         return False
-    if gp != pp:   # one side was converted between pX and molar: allow rounding
+    if gp != pp:   # one side was converted (pX or mass -> molar): allow rounding
         return all(g > 0 and p > 0 and abs(math.log10(g) - math.log10(p)) <= LOG_TOL_CONVERTED for g, p in zip(gv, pv))
     return all(math.isclose(g, p, rel_tol=VALUE_REL_TOL, abs_tol=1e-12) for g, p in zip(gv, pv))
 
@@ -425,6 +493,7 @@ def score_document(gold, pred):
         "record_tp_label": _record_tp(_records(g_measurements, g_table, by_label=True),
                                       _records(p_measurements, p_table, by_label=True)),
         "n_gold_rec": sum(1 for k, _ in g_recs if k is not None),
+        "n_gold_rec_unscorable": sum(1 for k, _ in g_recs if k is None),
         "n_pred_rec": len(p_recs),
         "n_orphan_rec": sum(1 for m in p_measurements if _norm_label(m.get("compound_id")) not in p_table),
     }
@@ -497,7 +566,8 @@ def aggregate(per_doc, scalar="auto"):
     }
     out = {k: float(v) for k, v in out.items()}
     out.update({"scalar": mode, "n_docs": len(per_doc), "n_gold_struct": get("n_gold_struct"),
-                "n_gold_unscorable": get("n_gold_unscorable"), "n_gold_rec": get("n_gold_rec")})
+                "n_gold_unscorable": get("n_gold_unscorable"), "n_gold_rec": get("n_gold_rec"),
+                "n_gold_rec_unscorable": get("n_gold_rec_unscorable")})
     return out
 
 

@@ -59,6 +59,11 @@ class StructureKeyTests(unittest.TestCase):
         self.assertNotEqual(para_meta, score.structure_key("*Cl.c1ccncc1 |m:0:3.4|"))
         self.assertFalse(score.is_multifragment(cl_any))
 
+    def test_metal_complexes_are_keyed_as_drawn(self):
+        cisplatin = score.structure_key("N.N.Cl[Pt]Cl")
+        self.assertEqual(cisplatin, score.structure_key("[NH3+][Pt-2]([NH3+])(Cl)Cl"))
+        self.assertNotEqual(cisplatin, score.structure_key("N"))
+
     def test_atom_maps_and_labels_on_real_atoms_are_ignored(self):
         self.assertEqual(score.structure_key("[CH3:1][C:2](=O)O"), score.structure_key("CC(=O)O"))
         self.assertEqual(score.structure_key("[1*]c1ccc(C)cc1 |$;;;;Me;;;$|"), score.structure_key("[1*]c1ccc(C)cc1"))
@@ -96,8 +101,48 @@ class MeasurementTests(unittest.TestCase):
         b = score.normalize_measurement(meas("1", 10, unit="μM", endpoint="ic50", relation=">"))
         self.assertEqual(a, b)
 
-    def test_non_numeric_value(self):
-        self.assertIsNone(score.normalize_measurement(meas("1", "n.d.")))
+    def test_missing_value(self):
+        self.assertIsNone(score.normalize_measurement(meas("1", None)))
+        self.assertIsNone(score.normalize_measurement(meas("1", "")))
+
+    def test_categorical_values(self):
+        nd = score.normalize_measurement(meas("1", "n.d."))
+        self.assertEqual(nd[2], "cat:nd")
+        self.assertEqual(nd, score.normalize_measurement(meas("1", "N.D.", unit="")))
+        self.assertNotEqual(score.normalize_measurement(meas("1", "+++"))[2],
+                            score.normalize_measurement(meas("1", "++"))[2])
+
+    def test_value_strings(self):
+        gt = score.normalize_measurement(meas("1", ">10", unit="uM"))
+        self.assertEqual((gt[2], gt[5]), (">", (10000.0,)))
+        rng = score.normalize_measurement(meas("1", "10–30", unit="nM"))
+        self.assertEqual((rng[2], rng[5]), ("range", (10.0, 30.0)))
+        self.assertEqual(score.normalize_measurement(meas("1", "1,200"))[5], (1200.0,))
+        self.assertEqual(score.normalize_measurement(meas("1", "−0.5", unit="", endpoint="logD"))[5], (-0.5,))
+        self.assertEqual(score.normalize_measurement(meas("1", "1e-5", unit="M"))[5], (1e-5 * 1e9,))
+
+    def test_more_unit_and_endpoint_spellings(self):
+        a = score.normalize_measurement(meas("1", 5, unit="µmol/L"))
+        b = score.normalize_measurement(meas("1", 5, unit="uM"))
+        self.assertEqual(a, b)
+        self.assertEqual(score._norm_endpoint("Kᵢ"), score._norm_endpoint("Ki"))
+        self.assertEqual(score._norm_endpoint("T½"), "t1/2")
+        self.assertEqual(score._norm_endpoint("half-life"), "t1/2")
+        px = score.normalize_measurement(meas("1", 7, unit="M", endpoint="pIC50"))
+        self.assertEqual((px[0], px[3]), ("ic50", "molar"))
+
+    def test_concentration_written_in_endpoint(self):
+        a = score.normalize_measurement(meas("1", 87, unit="%", endpoint="% inh @ 1 µM"))
+        b = dict(meas("1", 87, unit="%", endpoint="% inhibition"), conc=1, conc_unit="uM")
+        self.assertEqual(a, score.normalize_measurement(b))
+
+    def test_mass_concentration_uses_structure_mw(self):
+        mw = score.mol_weight(ASPIRIN)
+        gold = score.normalize_measurement(meas("1", 1.8, unit="ug/mL", endpoint="MIC"), mw)
+        pred = score.normalize_measurement(meas("1", 10, unit="uM", endpoint="MIC"), mw)
+        self.assertEqual(gold[:5], pred[:5])
+        self.assertTrue(score._close(gold[5:], pred[5:]))
+        self.assertEqual(score.normalize_measurement(meas("1", 1.8, unit="ug/mL", endpoint="MIC"))[3], "unit:ug/ml")
 
     def test_unit_inside_endpoint_name_is_ignored(self):
         a = score.normalize_measurement(meas("1", 1.2, unit="uM", endpoint="IC50 (µM)"))
