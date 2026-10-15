@@ -12,7 +12,9 @@ Gold and predictions are JSONL files, one document (a page, a crop, or a patent)
                     {"compound_id": "12a", "target": "EGFR", "endpoint": "% inhibition",
                      "value": 87, "unit": "%", "conc": 1, "conc_unit": "uM"},
                     {"compound_id": "12a", "target": "hERG", "endpoint": "IC50",
-                     "value": [10, 30], "unit": "uM"}]}
+                     "value": [10, 30], "unit": "uM", "assay_type": "cell"},
+                    {"compound_id": "12a", "target": "", "endpoint": "CL", "value": "25",
+                     "unit": "mL/min/kg", "species": "rat", "dose": 1, "dose_unit": "mg/kg", "route": "iv"}]}
 
 `family_id` (patent family / article) is the bootstrap cluster and defaults to doc_id;
 `slice` (gold only) groups documents for per-slice reporting and slice weighting; `tags`
@@ -21,7 +23,11 @@ subsets that are reported separately (a document may carry several tags). An OCS
 simply a document with one compound and no measurements. A value given as [lo, hi] is a
 range; value strings such as ">10", "10–30", "12 ± 3", "1.2 × 10⁻⁵", "10 µM" (unit inside the
 value) and "n.d." are parsed, and a unit missing from `unit` is taken from the value string or
-from the endpoint header ("IC50 (µM)").
+from the endpoint header ("IC50 (µM)", "Papp (10⁻⁶ cm/s)"). Compound units (mL/min/kg vs
+L/h/kg, ng·h/mL vs µg·h/mL) are compared by dimension. Record key v2: the optional context
+fields assay_type, species, matrix (or cell_line), variant, ph, dose/dose_unit and route --
+also recognized in the header ("CLint (HLM)", "logD7.4") -- count only where the gold fills
+them. Labels keep Latin, Greek and Chinese characters ("PI3Kα", "抑制率").
 
 Structures are SMILES/CXSMILES. Markush/R-group positions are dummy atoms written as
 `[1*]`, `[*:1]` or a CXSMILES label (`*... |$R1$|`, `_R1`); all three mean R1. Racemic or
@@ -251,26 +257,76 @@ _MASS_TO_G_PER_L = {"g/l": 1.0, "mg/ml": 1.0, "ug/ml": 1e-3, "ng/ml": 1e-6, "pg/
 _PX_UNITS = {"", "m", "log", "logm", "logunit", "logunits"}
 _TIME_TO_H = {"s": 1 / 3600, "sec": 1 / 3600, "min": 1 / 60, "mins": 1 / 60, "minutes": 1 / 60,
               "h": 1.0, "hr": 1.0, "hrs": 1.0, "hours": 1.0, "d": 24.0, "days": 24.0}
+# Atomic units of compound units (clearance, AUC, permeability, doses): token -> (dimension,
+# factor to the base unit L, h, g, mol or m). 'mL/min/kg' and 'L/h/kg' both become class
+# 'dim:mass-1.time-1.vol+1'; molar concentrations and plain times keep their own classes.
+_ATOMIC_UNITS = {
+    **{k: ("vol", f) for k, f in {"l": 1.0, "dl": 0.1, "ml": 1e-3, "ul": 1e-6, "nl": 1e-9}.items()},
+    **{k: ("time", f) for k, f in _TIME_TO_H.items()},
+    **{k: ("mass", f) for k, f in {"kg": 1e3, "g": 1.0, "mg": 1e-3, "ug": 1e-6, "ng": 1e-9, "pg": 1e-12}.items()},
+    **{k: ("amount", f) for k, f in {"mol": 1.0, "mmol": 1e-3, "umol": 1e-6, "nmol": 1e-9, "pmol": 1e-12}.items()},
+    **{k: ("length", f) for k, f in {"m": 1.0, "cm": 1e-2, "mm": 1e-3, "um": 1e-6, "nm": 1e-9}.items()},
+}
+_UNIT_ALIASES = {"mpk": "mg/kg", "hr": "h"}
+# '×10⁻⁶ cm/s', '10^-6 cm/s', '10-6 cm/s', '1e-6 cm/s': a decimal multiplier written in the unit.
+_MULTIPLIER = re.compile(r"^\s*(?:[x×*]\s*)?(?:10\s*(?:\^\s*([+\-−]?\d+)|([⁻⁺]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)|([\-−]\d+))|1e([+\-]?\d+))\s*", re.I)
 _P_ENDPOINTS = {"pic50": "ic50", "pki": "ki", "pkd": "kd", "pec50": "ec50", "pgi50": "gi50"}
-_ENDPOINT_SYNONYMS = {"inhibition": "%inhibition", "%inh": "%inhibition", "inhibition%": "%inhibition",
-                      "%inhibition": "%inhibition", "t12": "t1/2", "halflife": "t1/2", "thalf": "t1/2"}
+_ENDPOINT_SYNONYMS = {
+    "inhibition": "%inhibition", "%inh": "%inhibition", "inhibition%": "%inhibition", "%inhibition": "%inhibition",
+    "抑制率": "%inhibition", "半数抑制浓度": "ic50",
+    "t12": "t1/2", "halflife": "t1/2", "thalf": "t1/2", "半衰期": "t1/2",
+    "f%": "f", "%f": "f", "bioavailability": "f", "oralbioavailability": "f", "生物利用度": "f", "口服生物利用度": "f",
+    "clearance": "cl", "清除率": "cl", "intrinsicclearance": "clint", "内在清除率": "clint", "vdss": "vss",
+    "plasmaproteinbinding": "ppb", "血浆蛋白结合率": "ppb", "表观渗透系数": "papp", "溶解度": "solubility",
+}
+_PERCENT_ENDPOINTS = {"%inhibition", "f", "ppb"}   # an empty unit means '%'
 _RELATIONS = {"": "=", "=": "=", "==": "=", "~": "=", "≈": "=", "<": "<", "<=": "<", "≤": "<",
               ">": ">", ">=": ">", "≥": ">", "range": "range"}
 _FLIP = {"=": "=", "<": ">", ">": "<", "range": "range"}
+# Latin letters, digits and '%', plus Greek (PI3Kα vs PI3Kβ) and CJK (Chinese headers and targets).
+_TEXT_DROP = re.compile(r"[^0-9a-z%Ͱ-Ͽ㐀-鿿豈-﫿]+")
 
 
 def _norm_text(s):
-    s = str(s or "").translate(_SUBSCRIPTS).casefold()
-    return re.sub(r"[^0-9a-z%]+", "", s)
+    return _TEXT_DROP.sub("", str(s or "").translate(_SUBSCRIPTS).casefold())
 
 
 _AT_CONC = re.compile(r"(?:@|\bat\b)\s*([0-9]*\.?[0-9]+)\s*([a-zA-Zµμ]+(?:/[a-zA-Z]+)?)")
+_PH = re.compile(r"(?i)(?:@\s*|\bat\s+)?\bpH\s*=?\s*(\d+(?:\.\d+)?)")
+_LOGD_PH = re.compile(r"(?i)\b(log\s*D)\s*(\d+(?:\.\d+)?)\b")
+_BRACKETS = re.compile(r"[\(（\[【]\s*([^\)）\]】]*?)\s*[\)）\]】]")
+_DIRECTION = re.compile(r"(?i)^\s*[ab]\s*(?:→|->|-|to)\s*[ab]\s*$")
+
+
+def _endpoint_parts(s):
+    """
+    'IC₅₀ (µM)' -> ('ic50', {}); 'logD7.4' -> ('logd', {'ph': '7.4'}); 'CLint (HLM)' ->
+    ('clint', {'matrix': ..., 'species': 'human'}); 'Papp (A→B)' -> ('pappab', {}).
+    Bracketed units, concentrations and pH are removed from the name; bracketed species,
+    matrices and transport directions are kept as context or as part of the name.
+    """
+    s = str(s or "")
+    ctx = {}
+    ph = _PH.search(s) or _LOGD_PH.search(s)
+    if ph:
+        ctx["ph"] = f"{float(ph.group(ph.lastindex)):.1f}"
+    s = _LOGD_PH.sub(r"\1", _PH.sub("", s))
+    s = re.sub(_AT_CONC.pattern, "", s)
+
+    def bracket(mm):
+        inner = mm.group(1)
+        if _DIRECTION.match(inner):
+            return inner
+        for field, value in _context_from_text(inner).items():
+            ctx.setdefault(field, value)
+        return ""
+
+    e = _norm_text(_BRACKETS.sub(bracket, s))
+    return _ENDPOINT_SYNONYMS.get(e, e), ctx
 
 
 def _norm_endpoint(s):
-    """'IC₅₀ (µM)' -> 'ic50': units written inside the endpoint name are dropped."""
-    e = _norm_text(re.sub(r"\(.*?\)|\[.*?\]|" + _AT_CONC.pattern, "", str(s or "")))
-    return _ENDPOINT_SYNONYMS.get(e, e)
+    return _endpoint_parts(s)[0]
 
 
 def _norm_unit(s):
@@ -283,19 +339,169 @@ def _norm_unit(s):
     num, den = [], []
     for sep, tok, inv in re.findall(r"([/·*.\s]?)\s*([a-z%]+)(§?)", s):
         (den if sep == "/" or inv else num).append(tok)
-    return ".".join(num) + "".join("/" + t for t in den)
+    u = ".".join(num) + "".join("/" + t for t in den)
+    return _UNIT_ALIASES.get(u, u)
+
+
+def _split_multiplier(unit):
+    """'×10⁻⁶ cm/s' -> (1e-6, 'cm/s')."""
+    s = str(unit or "")
+    m = _MULTIPLIER.match(s)
+    if not m or not re.search(r"[a-zA-Zµμ%]", s[m.end():]):
+        return 1.0, s
+    exp = next(g for g in m.groups() if g is not None).translate(_SUPERSCRIPTS).replace("−", "-")
+    return 10.0 ** int(exp), s[m.end():]
+
+
+def _unit_dims(u):
+    """Canonical unit string -> (dimension signature, factor to base units), or None."""
+    parts = u.split("/")
+    exps, factor = {}, 1.0
+    for sign, toks in ((1, parts[0].split(".") if parts[0] else []), (-1, parts[1:])):
+        for tok in toks:
+            if tok not in _ATOMIC_UNITS:
+                return None
+            dim, f = _ATOMIC_UNITS[tok]
+            exps[dim] = exps.get(dim, 0) + sign
+            factor = factor * f if sign > 0 else factor / f
+    if not exps:
+        return None
+    return ".".join(f"{d}{e:+d}" for d, e in sorted(exps.items()) if e) or "ratio", factor
+
+
+def _is_pow10(f):
+    return abs(math.log10(f) - round(math.log10(f))) < 1e-9
 
 
 def _to_canonical(value, unit, mw=None):
-    """(value, unit) -> (unit_class, value in canonical unit, converted_via_mw)."""
-    u = _norm_unit(unit)
+    """
+    (value, unit) -> (unit_class, value in canonical unit, converted). `converted` is set when
+    the value went through a non-decimal factor (mass -> molar via MW, minutes -> hours,
+    mL/min/kg -> L/h/kg ...), so that it is compared against the gold's printed rounding.
+    """
+    mult, rest = _split_multiplier(unit)
+    value = value * mult
+    u = _norm_unit(rest)
     if u in _MOLAR_TO_NM:
         return "molar", value * _MOLAR_TO_NM[u], False
     if u in _MASS_TO_G_PER_L and mw:
         return "molar", value * _MASS_TO_G_PER_L[u] / mw * 1e9, True
     if u in _TIME_TO_H:
-        return "time", value * _TIME_TO_H[u], False
+        return "time", value * _TIME_TO_H[u], not _is_pow10(_TIME_TO_H[u])
+    dims = _unit_dims(u)
+    if dims:
+        return "dim:" + dims[0], value * dims[1], not _is_pow10(dims[1])
     return "unit:" + u, value, False
+
+
+def _looks_like_unit(text):
+    mult, rest = _split_multiplier(text)
+    u = _norm_unit(rest)
+    return bool(u) and (u in _MOLAR_TO_NM or u in _MASS_TO_G_PER_L or u in _TIME_TO_H or u == "%"
+                        or _unit_dims(u) is not None)
+
+
+# Record context (key v2). A field counts only when the gold fills it ("gold-defined fields"):
+# inferring the right species is rewarded, filling in a wrong one is not, leaving it out when
+# the gold has it is a miss.
+_CONTEXT_FIELDS = ("assay_type", "species", "matrix", "variant", "ph", "dose", "route")
+_FIELD_ALIASES = {"cell_line": "matrix", "cell_line_or_matrix": "matrix", "mutant": "variant"}
+_SPECIES = {"human": "human", "homosapiens": "human", "人": "human", "rat": "rat", "大鼠": "rat",
+            "mouse": "mouse", "mice": "mouse", "小鼠": "mouse", "dog": "dog", "beagle": "dog", "beagledog": "dog",
+            "犬": "dog", "比格犬": "dog", "monkey": "monkey", "cyno": "monkey", "cynomolgus": "monkey",
+            "cynomolgusmonkey": "monkey", "rhesus": "monkey", "rhesusmonkey": "monkey", "猴": "monkey",
+            "食蟹猴": "monkey", "minipig": "minipig", "rabbit": "rabbit", "hamster": "hamster", "guineapig": "guineapig"}
+_MATRICES = {"livermicrosomes": "liver_microsomes", "microsomes": "liver_microsomes", "lm": "liver_microsomes",
+             "肝微粒体": "liver_microsomes", "hepatocytes": "hepatocytes", "肝细胞": "hepatocytes",
+             "plasma": "plasma", "血浆": "plasma", "blood": "blood", "全血": "blood", "serum": "serum", "血清": "serum"}
+_MATRIX_SPECIES = {"hlm": ("liver_microsomes", "human"), "rlm": ("liver_microsomes", "rat"),
+                   "mlm": ("liver_microsomes", "mouse"), "dlm": ("liver_microsomes", "dog"),
+                   "cylm": ("liver_microsomes", "monkey"), "mklm": ("liver_microsomes", "monkey"),
+                   "hh": ("hepatocytes", "human"), "rh": ("hepatocytes", "rat")}
+_ASSAY_TYPES = {"biochemical": "biochemical", "biochem": "biochemical", "enzymatic": "biochemical",
+                "enzyme": "biochemical", "enzymeassay": "biochemical", "生化": "biochemical", "酶": "biochemical",
+                "酶活": "biochemical", "cell": "cell", "cellular": "cell", "cellbased": "cell", "细胞": "cell",
+                "invivo": "invivo", "体内": "invivo", "binding": "binding", "结合": "binding"}
+_ROUTES = {"iv": "iv", "intravenous": "iv", "静脉": "iv", "静脉注射": "iv", "po": "po", "oral": "po",
+           "peroral": "po", "口服": "po", "灌胃": "po", "ip": "ip", "intraperitoneal": "ip", "腹腔": "ip",
+           "腹腔注射": "ip", "sc": "sc", "subcutaneous": "sc", "皮下": "sc", "皮下注射": "sc"}
+_WILD_TYPE = {"wt", "wildtype", "野生型"}
+
+
+def _matrix_species(text):
+    """'HLM' / 'human liver microsomes' / '人肝微粒体' -> (matrix, species or None)."""
+    t = _norm_text(text)
+    if t in _MATRIX_SPECIES:
+        return _MATRIX_SPECIES[t]
+    if t in _MATRICES:
+        return _MATRICES[t], None
+    for word, species in sorted(_SPECIES.items(), key=lambda kv: -len(kv[0])):
+        if t.startswith(word) and t[len(word):] in _MATRICES:
+            return _MATRICES[t[len(word):]], species
+    return t, None
+
+
+def _context_from_text(text):
+    """Context recognizable in a bracket of an endpoint header: '(HLM)', '(rat)', '(cell)'."""
+    t = _norm_text(text)
+    if not t or _looks_like_unit(text):
+        return {}
+    if t in _SPECIES:
+        return {"species": _SPECIES[t]}
+    if t in _ASSAY_TYPES:
+        return {"assay_type": _ASSAY_TYPES[t]}
+    if t in _ROUTES:
+        return {"route": _ROUTES[t]}
+    matrix, species = _matrix_species(text)
+    if matrix != t or species:
+        return {"matrix": matrix, **({"species": species} if species else {})}
+    return {}
+
+
+def _context(m, from_endpoint):
+    """Normalized context fields of a measurement -> tuple of (field, value) pairs."""
+    raw = dict(m)
+    for alias, field in _FIELD_ALIASES.items():
+        if raw.get(field) in (None, "") and raw.get(alias) not in (None, ""):
+            raw[field] = raw[alias]
+    ctx = {}
+    for field in _CONTEXT_FIELDS:
+        v = raw.get(field)
+        if v is None or str(v).strip() == "":
+            continue
+        if field == "species":
+            t = _norm_text(v)
+            ctx[field] = _SPECIES.get(t, t)
+        elif field == "matrix":
+            matrix, species = _matrix_species(v)
+            ctx[field] = matrix
+            if species:
+                ctx.setdefault("species", species)
+        elif field == "assay_type":
+            t = _norm_text(v)
+            ctx[field] = _ASSAY_TYPES.get(t, t)
+        elif field == "route":
+            t = _norm_text(v)
+            ctx[field] = _ROUTES.get(t, t)
+        elif field == "variant":
+            toks = sorted(_norm_text(x) for x in re.split(r"[/,;+&\s]+", str(v)) if _norm_text(x))
+            ctx[field] = "wt" if set(toks) <= _WILD_TYPE else "|".join(toks)
+        elif field == "ph":
+            try:
+                ctx[field] = f"{float(v):.1f}"
+            except (TypeError, ValueError):
+                ctx[field] = _norm_text(v)
+        elif field == "dose":
+            try:
+                cls, val, _ = _to_canonical(float(v), raw.get("dose_unit"))
+                ctx[field] = f"{cls}:{val:.4g}"
+            except (TypeError, ValueError):
+                ctx[field] = _norm_text(v)
+    for field, value in from_endpoint.items():   # context written in the endpoint header
+        ctx.setdefault(field, value)
+    if ctx.get("species") and ctx.get("species") not in _SPECIES.values():
+        ctx["species"] = _norm_text(ctx["species"])
+    return tuple(sorted((k, v) for k, v in ctx.items() if v))
 
 
 _NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?"
@@ -305,14 +511,12 @@ _WITH_UNIT = re.compile(rf"^({_NUM}(?:\s*(?:-|–|—|to)\s*{_NUM})?)\s*([^\d\s.
 _TIMES_TEN = re.compile(r"\s*[x×*·]\s*10\s*\^?\s*([⁻⁺+-]?[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)")
 _SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+")
 _PLUS_MINUS = re.compile(rf"\s*\(?\s*(?:±|\+/-|\+-)\s*{_NUM}\s*\)?|\s*\(\s*n\s*=\s*\d+\s*\)", re.I)
-_KNOWN_UNITS = set(_MOLAR_TO_NM) | set(_MASS_TO_G_PER_L) | set(_TIME_TO_H) | {"%"}
 
 
 def _header_unit(endpoint):
     """Unit written in the column header / endpoint name, e.g. 'IC50 (µM)' -> 'µM'."""
-    for group in re.findall(r"[\(\[]\s*([^\)\]]+?)\s*[\)\]]", str(endpoint or "")):
-        u = _norm_unit(group)
-        if u in _KNOWN_UNITS or (u and "/" in u and re.fullmatch(r"[a-z%./]+", u)):
+    for group in _BRACKETS.findall(str(endpoint or "")):
+        if _looks_like_unit(group):
             return group
     return ""
 
@@ -364,16 +568,20 @@ def _parse_value(raw, relation):
 
 def normalize_measurement(m, mw=None):
     """
-    -> (endpoint, target, relation, unit_class, condition, values, converted, bounds), or None
-    if there is no value. `bounds` is the printed-rounding interval of each value, in the
-    same canonical unit. `values` is one number, (lo, hi) for a range, or () for a categorical
-    value (whose text then sits in `relation`), in a canonical unit: molar concentrations in
-    nM, times in hours. p-values (pIC50 etc.) are converted to nM with the relation flipped,
-    and mass concentrations (µg/mL) to nM using `mw`, the record's structure; `converted`
-    marks both, so that the printed and a converted form can still match within rounding.
-    `condition` is the test concentration of single-dose endpoints such as % inhibition,
-    given as conc/conc_unit or written in the endpoint ('% inh @ 1 µM'). An empty unit field
-    falls back to a unit written in the value ('10 µM') or in the header ('IC50 (µM)').
+    -> (endpoint, target, relation, unit_class, condition, values, converted, bounds, context),
+    or None if there is no value, or if a non-empty endpoint or target normalizes to nothing.
+    `bounds` is the printed-rounding interval of each value, in the same canonical unit.
+    `values` is one number, (lo, hi) for a range, or () for a categorical value (whose text
+    then sits in `relation`), in a canonical unit: molar concentrations in nM, times in hours,
+    compound units (mL/min/kg, ng·h/mL, 10⁻⁶ cm/s ...) in base units. p-values (pIC50 etc.)
+    are converted to nM with the relation flipped, and mass concentrations (µg/mL) to nM using
+    `mw`, the record's structure; `converted` marks non-decimal conversions, so that the
+    printed and a converted form can still match within rounding. `condition` is the test
+    concentration of single-dose endpoints such as % inhibition, given as conc/conc_unit or
+    written in the endpoint ('% inh @ 1 µM'). An empty unit field falls back to a unit written
+    in the value ('10 µM') or in the header ('IC50 (µM)', 'Papp (10⁻⁶ cm/s)'). `context` holds
+    the record-key-v2 fields (assay_type, species, matrix, variant, ph, dose, route), also
+    when written in the header ('CLint (HLM)', 'logD7.4'); they count only where the gold has them.
     """
     parsed = _parse_value(m.get("value"), str(m.get("relation") or "").strip())
     if parsed is None:
@@ -381,12 +589,15 @@ def normalize_measurement(m, mw=None):
     values, halves, relation, category, inline_unit = parsed
     if len(values) > 2 or not all(math.isfinite(v) for v in values):
         return None
+    endpoint, header_ctx = _endpoint_parts(m.get("endpoint"))
+    target = _norm_text(m.get("target")) if MATCH_TARGET else ""
+    if (str(m.get("endpoint") or "").strip() and not endpoint) or \
+            (MATCH_TARGET and str(m.get("target") or "").strip() and not target):
+        return None   # e.g. a label in a script this scorer does not keep: fail closed
     unit = m.get("unit")
     if not str(unit or "").strip():   # unit written in the value, else in the column header
-        unit = inline_unit or _header_unit(m.get("endpoint"))
+        unit = inline_unit or _header_unit(m.get("endpoint")) or ("%" if endpoint in _PERCENT_ENDPOINTS else "")
     bounds = tuple((v - h, v + h) for v, h in zip(values, halves))
-    endpoint = _norm_endpoint(m.get("endpoint"))
-    target = _norm_text(m.get("target")) if MATCH_TARGET else ""
     relation = "range" if len(values) == 2 else _RELATIONS.get(relation, "?")
     converted = False
     if category is not None:
@@ -398,7 +609,7 @@ def normalize_measurement(m, mw=None):
     else:
         canon = [_to_canonical(v, unit, mw) for v in values]
         unit_class, converted = canon[0][0], canon[0][2]
-        scale = [c[1] / v if v else 1.0 for c, v in zip(canon, values)]
+        scale = [c[1] / v if v else _to_canonical(1.0, unit, mw)[1] for c, v in zip(canon, values)]
         values = tuple(c[1] for c in canon)
         bounds = tuple((lo * k, hi * k) for (lo, hi), k in zip(bounds, scale))
     order = sorted(range(len(values)), key=lambda i: values[i])
@@ -415,7 +626,7 @@ def normalize_measurement(m, mw=None):
             condition = f"{cls}:{cval:.4g}"
         except (TypeError, ValueError):
             condition = "?"
-    return endpoint, target, relation, unit_class, condition, values, converted, bounds
+    return endpoint, target, relation, unit_class, condition, values, converted, bounds, _context(m, header_ctx)
 
 # ---------------------------------------------------------------------------
 # Per-document scoring
@@ -452,7 +663,7 @@ def _multiset_tp(gold_keys, pred_keys):
 
 
 def _records(measurements, table, by_label):
-    """Measurements -> list of (key_tuple, (values, converted, bounds)). Unresolvable records keep key None."""
+    """Measurements -> list of (key_tuple, (values, converted, bounds, context)). Unresolvable records keep key None."""
     out = []
     for m in measurements:
         cid = _norm_label(m.get("compound_id"))
@@ -464,14 +675,15 @@ def _records(measurements, table, by_label):
         if norm is None or ckey is None:
             out.append((None, None))
             continue
-        *fields, values, converted, bounds = norm
-        out.append(((ckey, *fields), (values, converted, bounds)))
+        *fields, values, converted, bounds, context = norm
+        out.append(((ckey, *fields), (values, converted, bounds, context)))
     return out
 
 
 def _close(gold, pred):
-    (gv, gc, gb), (pv, pc, _) = gold, pred
-    if len(gv) != len(pv):
+    """Values agree within tolerance, and every context field the gold fills agrees."""
+    (gv, gc, gb, g_ctx), (pv, pc, _, p_ctx) = gold, pred
+    if len(gv) != len(pv) or not set(g_ctx) <= set(p_ctx):
         return False
     if gc != pc:   # one side was converted: the prediction must round to the gold as printed
         return all(lo * (1 - 1e-9) <= p <= hi * (1 + 1e-9) for (lo, hi), p in zip(gb, pv))

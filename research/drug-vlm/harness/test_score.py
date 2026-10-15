@@ -157,7 +157,9 @@ class MeasurementTests(unittest.TestCase):
         pred = score.normalize_measurement(meas("1", 10, unit="uM", endpoint="MIC"), mw)
         self.assertEqual(gold[:5], pred[:5])
         self.assertTrue(score._close(gold[5:], pred[5:]))
-        self.assertEqual(score.normalize_measurement(meas("1", 1.8, unit="ug/mL", endpoint="MIC"))[3], "unit:ug/ml")
+        no_mw = score.normalize_measurement(meas("1", 1.8, unit="ug/mL", endpoint="MIC"))
+        self.assertEqual(no_mw[3], "dim:mass+1.vol-1")   # without a structure: compared as mass/volume
+        self.assertEqual(no_mw[:6], score.normalize_measurement(meas("1", 1.8, unit="mg/L", endpoint="MIC"))[:6])
 
     def test_unit_inside_endpoint_name_is_ignored(self):
         a = score.normalize_measurement(meas("1", 1.2, unit="uM", endpoint="IC50 (µM)"))
@@ -205,6 +207,81 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(a[:5], b[:5])
         self.assertTrue(score._close(a[5:], b[5:]))
         self.assertNotEqual(a[:5], c[:5])
+
+
+def record_tp(gold_m, pred_m):
+    """record_tp for one aspirin record on each side; fields are passed straight through."""
+    gold = doc([{"id": "1", "smiles": ASPIRIN}], [dict(compound_id="1", **gold_m)])
+    pred = doc([{"id": "1", "smiles": ASPIRIN}], [dict(compound_id="1", **pred_m)])
+    return score.score_document(gold, pred)["record_tp"]
+
+
+class RecordKeyV2Tests(unittest.TestCase):
+    def test_chinese_and_greek_labels_are_kept(self):
+        self.assertEqual(record_tp(dict(endpoint="抑制率", value=50, unit="%", target="EGFR"),
+                                   dict(endpoint="清除率", value=50, unit="%", target="EGFR")), 0)
+        self.assertEqual(record_tp(dict(endpoint="IC50", value=5, unit="nM", target="PI3Kα"),
+                                   dict(endpoint="IC50", value=5, unit="nM", target="PI3Kβ")), 0)
+        self.assertEqual(record_tp(dict(endpoint="半衰期", value=2, unit="h", target=""),
+                                   dict(endpoint="t1/2", value=120, unit="min", target="")), 1)
+        self.assertEqual(record_tp(dict(endpoint="抑制率", value=50, unit="%", target="EGFR"),
+                                   dict(endpoint="% inhibition", value=50, unit="%", target="EGFR")), 1)
+
+    def test_label_that_normalizes_to_nothing_fails_closed(self):
+        self.assertIsNone(score.normalize_measurement(meas("1", 5, endpoint="★★")))
+        self.assertIsNone(score.normalize_measurement(meas("1", 5, target="—")))
+
+    def test_gold_defined_context_fields(self):
+        base = dict(endpoint="CLint", value=12, unit="uL/min/mg", target="")
+        human, rat = dict(base, species="human", matrix="liver microsomes"), dict(base, species="rat", matrix="liver microsomes")
+        self.assertEqual(record_tp(human, rat), 0)
+        self.assertEqual(record_tp(human, dict(base, matrix="HLM")), 1)            # HLM implies human
+        self.assertEqual(record_tp(human, dict(base, endpoint="CLint (HLM)")), 1)  # context in the header
+        self.assertEqual(record_tp(human, base), 0)                                # gold has species, pred omits it
+        self.assertEqual(record_tp(base, human), 1)                                # pred adds a field gold lacks
+        ic50 = dict(endpoint="IC50", value=5, unit="nM", target="EGFR")
+        self.assertEqual(record_tp(dict(ic50, assay_type="biochemical"), dict(ic50, assay_type="cell")), 0)
+        self.assertEqual(record_tp(dict(ic50, assay_type="enzymatic"), dict(ic50, assay_type="生化")), 1)
+        self.assertEqual(record_tp(dict(ic50, variant="L858R/T790M"), dict(ic50, variant="T790M, L858R")), 1)
+        self.assertEqual(record_tp(dict(ic50, variant="L858R/T790M"), dict(ic50, variant="L858R")), 0)
+        pk = dict(endpoint="AUC", value=1200, unit="ng·h/mL", target="", dose=10, dose_unit="mg/kg", route="po")
+        self.assertEqual(record_tp(pk, dict(pk, dose=10, dose_unit="mpk", route="oral")), 1)
+        self.assertEqual(record_tp(pk, dict(pk, route="iv")), 0)
+        self.assertEqual(record_tp(pk, dict(pk, dose=1)), 0)
+
+    def test_compound_units_convert_by_dimension(self):
+        cl = dict(endpoint="CL", target="")
+        self.assertEqual(record_tp(dict(cl, value="25", unit="mL/min/kg"), dict(cl, value=1.5, unit="L/h/kg")), 1)
+        self.assertEqual(record_tp(dict(cl, value="25", unit="mL/min/kg"), dict(cl, value=1.6, unit="L/h/kg")), 0)
+        self.assertEqual(record_tp(dict(cl, value="1.5", unit="L/h/kg"), dict(cl, value=25, unit="mL·min⁻¹·kg⁻¹")), 1)
+        auc = dict(endpoint="AUC0-inf", target="")
+        self.assertEqual(record_tp(dict(auc, value="1.2", unit="µg·h/mL"), dict(auc, value=1200, unit="ng·h/mL")), 1)
+        self.assertEqual(record_tp(dict(auc, value="1.2", unit="µg·h/mL"), dict(auc, value=1.2, unit="ng·h/mL")), 0)
+        t = dict(endpoint="t1/2", target="")
+        self.assertEqual(record_tp(dict(t, value="50", unit="min"), dict(t, value=0.83, unit="h")), 1)
+
+    def test_decimal_multiplier_in_unit_or_header(self):
+        papp = dict(endpoint="Papp A→B", target="")
+        self.assertEqual(record_tp(dict(papp, value="12", unit="×10⁻⁶ cm/s"), dict(papp, value=1.2e-5, unit="cm/s")), 1)
+        self.assertEqual(record_tp(dict(papp, value="12", unit="10-6 cm/s"), dict(papp, value="12 × 10⁻⁶", unit="cm/s")), 1)
+        self.assertEqual(record_tp(dict(papp, endpoint="Papp A→B (10⁻⁶ cm/s)", value="12", unit=""),
+                                   dict(papp, value=1.2e-5, unit="cm/s")), 1)
+        self.assertEqual(record_tp(dict(papp, value="12", unit="cm/s"), dict(papp, value=1.2e-5, unit="cm/s")), 0)
+        # transport direction stays part of the endpoint
+        self.assertEqual(record_tp(dict(papp, endpoint="Papp (A→B)", value=1, unit="cm/s"),
+                                   dict(papp, endpoint="Papp (B→A)", value=1, unit="cm/s")), 0)
+
+    def test_percent_endpoints_and_logd_ph(self):
+        self.assertEqual(record_tp(dict(endpoint="F", value=45, unit="%", target=""),
+                                   dict(endpoint="F%", value=45, unit="", target="")), 1)
+        self.assertEqual(record_tp(dict(endpoint="F", value=45, unit="%", target=""),
+                                   dict(endpoint="oral bioavailability", value=45, unit="%", target="")), 1)
+        logd = dict(value="2.1", unit="", target="")
+        self.assertEqual(record_tp(dict(logd, endpoint="logD7.4"), dict(logd, endpoint="logD", ph=7.4)), 1)
+        self.assertEqual(record_tp(dict(logd, endpoint="logD (pH 7.4)"), dict(logd, endpoint="logD7.4")), 1)
+        self.assertEqual(record_tp(dict(logd, endpoint="logD7.4"), dict(logd, endpoint="logD", ph=6.5)), 0)
+        self.assertEqual(record_tp(dict(logd, endpoint="logD7.4"), dict(logd, endpoint="logD")), 0)
+        self.assertEqual(record_tp(dict(logd, endpoint="logD"), dict(logd, endpoint="logD7.4")), 1)
 
 
 class DocumentScoringTests(unittest.TestCase):
