@@ -108,6 +108,32 @@ class DocumentScoringTests(unittest.TestCase):
         self.assertEqual(s["orphan_record_rate"], 1.0)
         self.assertEqual(s["score"], 0.0)
 
+    def test_duplicate_records_are_false_positives(self):
+        pred = doc(
+            [{"id": "12a", "smiles": ASPIRIN}, {"id": "12b", "smiles": PARACETAMOL}],
+            [meas("12a", 12.3), meas("12a", 12.3), meas("12b", 450.0)],
+        )
+        s = score.aggregate([score.score_document(self.gold, pred)])
+        self.assertAlmostEqual(s["record_precision"], 2 / 3)
+        self.assertEqual(s["record_recall"], 1.0)
+
+    def test_joined_compound_ids_get_no_credit(self):
+        pred = doc(
+            [{"id": "12a", "smiles": ASPIRIN}, {"id": "12b", "smiles": PARACETAMOL}],
+            [meas("12a;12b", 12.3)],
+        )
+        s = score.aggregate([score.score_document(self.gold, pred)])
+        self.assertEqual(s["record_f1"], 0.0)
+        self.assertEqual(s["orphan_record_rate"], 1.0)
+
+    def test_unit_mismatch_and_flipped_qualifier_are_wrong(self):
+        pred = doc(
+            [{"id": "12a", "smiles": ASPIRIN}, {"id": "12b", "smiles": PARACETAMOL}],
+            [meas("12a", 12.3, unit="uM"), meas("12b", 450.0, relation="<")],
+        )
+        s = score.aggregate([score.score_document(self.gold, pred)])
+        self.assertEqual(s["record_f1"], 0.0)
+
     def test_empty_prediction(self):
         s = score.aggregate([score.score_document(self.gold, {})])
         self.assertEqual(s["score"], 0.0)
@@ -120,6 +146,24 @@ class DocumentScoringTests(unittest.TestCase):
         self.assertEqual(stereo_wrong["score"], 0.0)
         self.assertEqual(stereo_wrong["struct_f1_nostereo"], 1.0)
         self.assertEqual(stereo_wrong["struct_tanimoto"], 1.0)  # Morgan FP ignores chirality
+
+
+class FileScoringTests(unittest.TestCase):
+    def test_bad_prediction_lines_and_missing_docs_score_as_empty(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            gold_path, pred_path = os.path.join(tmp, "gold.jsonl"), os.path.join(tmp, "pred.jsonl")
+            with open(gold_path, "w") as f:
+                for i in range(3):
+                    f.write(json.dumps(doc([{"smiles": ASPIRIN}], doc_id=f"d{i}")) + "\n")
+            with open(pred_path, "w") as f:
+                f.write(json.dumps(doc([{"smiles": ASPIRIN}], doc_id="d0")) + "\n")
+                f.write(json.dumps(doc([{"smiles": PARACETAMOL}], doc_id="d0")) + "\n")  # later duplicate ignored
+                f.write("{not json\n")
+            per_doc, missing = score.score_files(gold_path, pred_path)
+        self.assertEqual(missing, 2)
+        self.assertAlmostEqual(score.aggregate(per_doc)["struct_recall"], 1 / 3)
+        self.assertEqual(score.aggregate(per_doc)["struct_precision"], 1.0)
 
 
 class StatisticsTests(unittest.TestCase):

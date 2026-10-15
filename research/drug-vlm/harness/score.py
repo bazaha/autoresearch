@@ -26,7 +26,7 @@ import re
 import sys
 from functools import lru_cache
 
-from rdkit import Chem, DataStructs, RDLogger
+from rdkit import Chem, DataStructs, RDLogger, __version__ as RDKIT_VERSION
 from rdkit.Chem import rdFingerprintGenerator
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
@@ -243,6 +243,7 @@ def score_document(gold, pred):
     p_recs_label = _records(pred, p_table, by_label=True)
     return {
         "doc_id": gold.get("doc_id"),
+        "n_gold_unscorable": len(g_keys) - len(g_valid),
         "struct_tp": _multiset_tp(g_valid, p_valid),
         "struct_tp_skeleton": _multiset_tp([skeleton_key(k) for k in g_valid], [skeleton_key(k) for k in p_valid]),
         "n_gold_struct": len(g_valid),
@@ -296,6 +297,7 @@ def aggregate(per_doc):
         "orphan_record_rate": get("n_orphan_rec") / get("n_pred_rec") if get("n_pred_rec") else 0.0,
         "n_docs": len(per_doc),
         "n_gold_struct": get("n_gold_struct"),
+        "n_gold_unscorable": get("n_gold_unscorable"),
         "n_gold_rec": get("n_gold_rec"),
     }
 
@@ -333,18 +335,36 @@ def paired_compare(base, new, alpha=0.10):
 # CLI
 # ---------------------------------------------------------------------------
 
-def _read_jsonl(path):
+def _read_jsonl(path, strict=True):
+    """Returns (rows, n_unparseable). Gold must parse; bad prediction lines are counted, not fatal."""
+    rows, bad = [], 0
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("not a JSON object")
+                rows.append(row)
+            except ValueError:
+                if strict:
+                    raise
+                bad += 1
+    return rows, bad
 
 
 def score_files(gold_path, pred_path):
-    gold = _read_jsonl(gold_path)
-    pred = {d.get("doc_id"): d for d in _read_jsonl(pred_path)}
+    """Every gold document is scored; a missing or unparseable prediction counts as empty."""
+    gold, _ = _read_jsonl(gold_path)
+    pred_rows, n_bad = _read_jsonl(pred_path, strict=False)
+    pred = {}
+    for d in pred_rows:
+        pred.setdefault(d.get("doc_id"), d)  # first prediction wins: no best-of-N
     missing = sum(1 for g in gold if g.get("doc_id") not in pred)
-    if missing:
-        print(f"warning: {missing} gold documents have no prediction (scored as empty)", file=sys.stderr)
-    return [score_document(g, pred.get(g.get("doc_id"), {})) for g in gold]
+    if missing or n_bad:
+        print(f"warning: {missing} gold documents without prediction, {n_bad} unparseable lines", file=sys.stderr)
+    return [score_document(g, pred.get(g.get("doc_id"), {})) for g in gold], missing
 
 
 def main():
@@ -360,7 +380,7 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "score":
-        per_doc = score_files(args.gold, args.pred)
+        per_doc, n_missing = score_files(args.gold, args.pred)
         if args.per_doc_out:
             with open(args.per_doc_out, "w") as f:
                 for d in per_doc:
@@ -371,8 +391,10 @@ def main():
         for k, v in summary.items():
             print(f"{k + ':':22s}{v:.6f}" if isinstance(v, float) else f"{k + ':':22s}{v}")
         print(f"{'score_ci95:':22s}[{lo:.6f}, {hi:.6f}]")
+        print(f"{'missing_pred_docs:':22s}{n_missing}")
+        print(f"{'rdkit_version:':22s}{RDKIT_VERSION}")
     else:
-        r = paired_compare(_read_jsonl(args.base), _read_jsonl(args.new))
+        r = paired_compare(_read_jsonl(args.base)[0], _read_jsonl(args.new)[0])
         print("---")
         print(f"{'delta:':22s}{r['delta']:+.6f}")
         print(f"{'delta_ci90:':22s}[{r['ci_lo']:+.6f}, {r['ci_hi']:+.6f}]")
