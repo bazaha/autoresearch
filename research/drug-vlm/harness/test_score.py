@@ -47,14 +47,14 @@ class MeasurementTests(unittest.TestCase):
     def test_unit_conversion(self):
         a = score.normalize_measurement(meas("1", 0.0123, unit="µM"))
         b = score.normalize_measurement(meas("1", 12.3, unit="nM"))
-        self.assertEqual(a[:4], b[:4])
-        self.assertAlmostEqual(a[4], b[4])
+        self.assertEqual(a[:5], b[:5])
+        self.assertAlmostEqual(a[5][0], b[5][0])
 
     def test_p_value_conversion_flips_relation(self):
         a = score.normalize_measurement(meas("1", 7.0, unit="", endpoint="pIC50", relation=">"))
         self.assertEqual(a[0], "ic50")
         self.assertEqual(a[2], "<")
-        self.assertAlmostEqual(a[4], 100.0)
+        self.assertAlmostEqual(a[5][0], 100.0)
 
     def test_relation_and_endpoint_normalization(self):
         a = score.normalize_measurement(meas("1", 10, unit="uM", endpoint="IC₅₀", relation="≥"))
@@ -63,6 +63,32 @@ class MeasurementTests(unittest.TestCase):
 
     def test_non_numeric_value(self):
         self.assertIsNone(score.normalize_measurement(meas("1", "n.d.")))
+
+    def test_unit_inside_endpoint_name_is_ignored(self):
+        a = score.normalize_measurement(meas("1", 1.2, unit="uM", endpoint="IC50 (µM)"))
+        b = score.normalize_measurement(meas("1", 1200, unit="nM", endpoint="IC50"))
+        self.assertEqual(a[:5], b[:5])
+
+    def test_compound_units_canonicalize(self):
+        self.assertEqual(score._norm_unit("mL·min⁻¹·kg⁻¹"), score._norm_unit("mL/min/kg"))
+        self.assertEqual(score._norm_unit("mL min-1 kg-1"), "ml/min/kg")
+        self.assertEqual(score._norm_unit("µM"), "um")
+
+    def test_single_dose_condition_must_match(self):
+        at_1um = dict(meas("1", 87, unit="%", endpoint="% inhibition"), conc=1, conc_unit="uM")
+        at_1000nm = dict(at_1um, conc=1000, conc_unit="nM")
+        at_10um = dict(at_1um, conc=10)
+        self.assertEqual(score.normalize_measurement(at_1um), score.normalize_measurement(at_1000nm))
+        self.assertNotEqual(score.normalize_measurement(at_1um), score.normalize_measurement(at_10um))
+
+    def test_ranges(self):
+        a = score.normalize_measurement(meas("1", [10, 30], unit="uM"))
+        b = score.normalize_measurement(meas("1", [30000, 10000], unit="nM"))
+        c = score.normalize_measurement(meas("1", 10, unit="uM"))
+        self.assertEqual(a[2], "range")
+        self.assertEqual(a[:5], b[:5])
+        self.assertTrue(score._close(a[5], b[5]))
+        self.assertNotEqual(a[:5], c[:5])
 
 
 class DocumentScoringTests(unittest.TestCase):
@@ -134,6 +160,13 @@ class DocumentScoringTests(unittest.TestCase):
         s = score.aggregate([score.score_document(self.gold, pred)])
         self.assertEqual(s["record_f1"], 0.0)
 
+    def test_unscorable_gold_does_not_penalize_precision(self):
+        gold = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": "not-a-smiles"}])
+        pred = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": PARACETAMOL}])
+        s = score.aggregate([score.score_document(gold, pred)])
+        self.assertEqual(s["struct_precision"], 1.0)
+        self.assertEqual(s["n_gold_unscorable"], 1)
+
     def test_empty_prediction(self):
         s = score.aggregate([score.score_document(self.gold, {})])
         self.assertEqual(s["score"], 0.0)
@@ -167,10 +200,10 @@ class FileScoringTests(unittest.TestCase):
 
 
 class StatisticsTests(unittest.TestCase):
-    def _per_doc(self, n_correct, n_total):
+    def _per_doc(self, n_correct, n_total, family_size=1):
         rows = []
         for i in range(n_total):
-            gold = doc([{"smiles": ASPIRIN}], doc_id=f"d{i}")
+            gold = dict(doc([{"smiles": ASPIRIN}], doc_id=f"d{i}"), family_id=f"f{i // family_size}")
             pred = doc([{"smiles": ASPIRIN if i < n_correct else PARACETAMOL}], doc_id=f"d{i}")
             rows.append(score.score_document(gold, pred))
         return rows
@@ -188,6 +221,17 @@ class StatisticsTests(unittest.TestCase):
         self.assertAlmostEqual(r["delta"], 0.10)
         self.assertGreater(r["ci_lo"], 0.0)
         self.assertLess(r["p_not_better"], 0.01)
+
+    def test_clustered_bootstrap_is_wider(self):
+        lo1, hi1 = score.bootstrap_ci(self._per_doc(70, 100))
+        # same accuracy, but correct/incorrect docs come in families of 10
+        clustered = self._per_doc(70, 100, family_size=10)
+        lo2, hi2 = score.bootstrap_ci(clustered)
+        self.assertGreater(hi2 - lo2, hi1 - lo1)
+        self.assertEqual(score.paired_compare(clustered, clustered)["n_clusters"], 10)
+
+    def test_rdkit_is_pinned_version(self):
+        self.assertEqual(score.RDKIT_VERSION, score.RDKIT_PIN)
 
     def test_paired_compare_identical_runs(self):
         rows = self._per_doc(50, 100)
