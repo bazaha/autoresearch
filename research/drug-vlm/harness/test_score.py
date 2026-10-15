@@ -28,9 +28,9 @@ class StructureKeyTests(unittest.TestCase):
         self.assertEqual(score.structure_key(ASPIRIN_NA_SALT), score.structure_key(ASPIRIN))
 
     def test_stereo_distinguished_but_same_skeleton(self):
-        k1, k2 = score.structure_key(L_ALA), score.structure_key(D_ALA)
+        (k1, s1), (k2, s2) = score.structure_keys(L_ALA), score.structure_keys(D_ALA)
         self.assertNotEqual(k1, k2)
-        self.assertEqual(score.skeleton_key(k1), score.skeleton_key(k2))
+        self.assertEqual(s1, s2)
 
     def test_invalid_smiles(self):
         self.assertIsNone(score.structure_key("C1CC"))
@@ -39,8 +39,31 @@ class StructureKeyTests(unittest.TestCase):
 
     def test_markush_dummy_atoms_use_cxsmiles(self):
         k1, k2 = score.structure_key("*c1ccccc1"), score.structure_key("c1ccc(*)cc1")
-        self.assertTrue(k1.startswith("CXSMILES:"))
+        self.assertTrue(k1.startswith("MARKUSH:"))
         self.assertEqual(k1, k2)
+
+    def test_r_label_conventions_are_equivalent(self):
+        spellings = ["[1*]c1ccccc1", "[*:1]c1ccccc1", "*c1ccccc1 |$R1;;;;;;$|", "*c1ccccc1 |$_R1;;;;;;$|"]
+        keys = {score.structure_key(s) for s in spellings}
+        self.assertEqual(len(keys), 1)
+        self.assertNotEqual(keys.pop(), score.structure_key("[2*]c1ccccc1"))
+
+    def test_atom_maps_on_real_atoms_are_ignored(self):
+        self.assertEqual(score.structure_key("[CH3:1][C:2](=O)O"), score.structure_key("CC(=O)O"))
+
+    def test_enhanced_stereo(self):
+        rac_a, rac_b = "C[C@H](N)C(=O)O |&1:1|", "C[C@@H](N)C(=O)O |&1:1|"
+        self.assertEqual(score.structure_key(rac_a), score.structure_key(rac_b))  # same racemate
+        self.assertNotEqual(score.structure_key(rac_a), score.structure_key(L_ALA))  # racemate != enantiomer
+        self.assertEqual(score.structure_keys(rac_a)[1], score.structure_keys(L_ALA)[1])
+
+    def test_multifragment_flag_ignores_salts_and_solvents(self):
+        self.assertFalse(score.is_multifragment(ASPIRIN_NA_SALT))
+        self.assertFalse(score.is_multifragment(ASPIRIN + ".CCO"))
+        self.assertTrue(score.is_multifragment(ASPIRIN + ".CCCCCCCC"))
+
+    def test_oversized_structure_is_invalid(self):
+        self.assertIsNone(score.structure_key("C" * (score.MAX_HEAVY_ATOMS + 1)))
 
 
 class MeasurementTests(unittest.TestCase):
@@ -81,13 +104,22 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(score.normalize_measurement(at_1um), score.normalize_measurement(at_1000nm))
         self.assertNotEqual(score.normalize_measurement(at_1um), score.normalize_measurement(at_10um))
 
+    def test_px_vs_converted_molar_allows_rounding_only(self):
+        gold = score.normalize_measurement(meas("1", 7.2, unit="", endpoint="pIC50"))
+        rounded = score.normalize_measurement(meas("1", 63, unit="nM"))
+        self.assertEqual(gold[:5], rounded[:5])
+        self.assertTrue(score._close(gold[5:], rounded[5:]))
+        same_scale_typo = score.normalize_measurement(meas("1", 12.5, unit="nM"))
+        same_scale_gold = score.normalize_measurement(meas("1", 12.3, unit="nM"))
+        self.assertFalse(score._close(same_scale_gold[5:], same_scale_typo[5:]))
+
     def test_ranges(self):
         a = score.normalize_measurement(meas("1", [10, 30], unit="uM"))
         b = score.normalize_measurement(meas("1", [30000, 10000], unit="nM"))
         c = score.normalize_measurement(meas("1", 10, unit="uM"))
         self.assertEqual(a[2], "range")
         self.assertEqual(a[:5], b[:5])
-        self.assertTrue(score._close(a[5], b[5]))
+        self.assertTrue(score._close(a[5:], b[5:]))
         self.assertNotEqual(a[:5], c[:5])
 
 
@@ -159,6 +191,35 @@ class DocumentScoringTests(unittest.TestCase):
         )
         s = score.aggregate([score.score_document(self.gold, pred)])
         self.assertEqual(s["record_f1"], 0.0)
+
+    def test_id_link_detects_swapped_labels(self):
+        pred = doc(
+            [{"id": "12b", "smiles": ASPIRIN}, {"id": "12a", "smiles": PARACETAMOL}],
+            [],
+        )
+        s = score.aggregate([score.score_document(self.gold, pred)], scalar="struct_f1")
+        self.assertEqual(s["struct_f1"], 1.0)
+        self.assertEqual(s["id_link_f1"], 0.0)
+
+    def test_prediction_caps(self):
+        old = score.MAX_PRED_COMPOUNDS
+        try:
+            score.MAX_PRED_COMPOUNDS = 2
+            pred = doc([{"id": "12a", "smiles": ASPIRIN}, {"id": "12b", "smiles": PARACETAMOL},
+                        {"id": "x", "smiles": ASPIRIN}])
+            row = score.score_document(self.gold, pred)
+        finally:
+            score.MAX_PRED_COMPOUNDS = old
+        self.assertEqual(row["n_pred_struct"], 3)
+        self.assertEqual(row["n_invalid_struct"], 1)
+        self.assertEqual(row["struct_tp"], 2)
+
+    def test_explicit_scalar(self):
+        pred = doc([{"id": "12a", "smiles": ASPIRIN}, {"id": "12b", "smiles": PARACETAMOL}], [])
+        rows = [score.score_document(self.gold, pred)]
+        self.assertEqual(score.aggregate(rows)["scalar"], "composite")
+        self.assertEqual(score.aggregate(rows)["score"], 0.5)
+        self.assertEqual(score.aggregate(rows, scalar="struct_f1")["score"], 1.0)
 
     def test_unscorable_gold_does_not_penalize_precision(self):
         gold = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": "not-a-smiles"}])
@@ -232,6 +293,12 @@ class StatisticsTests(unittest.TestCase):
 
     def test_rdkit_is_pinned_version(self):
         self.assertEqual(score.RDKIT_VERSION, score.RDKIT_PIN)
+
+    def test_seed_pooling(self):
+        a, b = self._per_doc(60, 100), self._per_doc(80, 100)
+        pooled = score.pool_seeds([a, b])
+        self.assertEqual(len(pooled), 100)
+        self.assertAlmostEqual(score.aggregate(pooled)["score"], 0.70)
 
     def test_paired_compare_identical_runs(self):
         rows = self._per_doc(50, 100)

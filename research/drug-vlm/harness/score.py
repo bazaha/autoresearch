@@ -16,23 +16,27 @@ Gold and predictions are JSONL files, one document (a page, a crop, or a patent)
 
 `family_id` (patent family / article) is the bootstrap cluster and defaults to doc_id;
 `slice` (gold only) groups documents for per-slice reporting. An OCSR crop is simply a
-document with one compound and no measurements. Markush/R-group structures may use
-dummy atoms (`*`, `[1*]`, CXSMILES R-labels). A value given as [lo, hi] is a range.
+document with one compound and no measurements. A value given as [lo, hi] is a range.
+
+Structures are SMILES/CXSMILES. Markush/R-group positions are dummy atoms written as
+`[1*]`, `[*:1]` or a CXSMILES label (`*... |$R1$|`, `_R1`); all three mean R1. Racemic or
+relative stereo uses CXSMILES enhanced stereo (`|&1:1|`, `|o1:1|`).
 
 Usage:
     python score.py score   --gold gold.jsonl --pred pred.jsonl [--per-doc-out per_doc.jsonl]
-    python score.py compare --base per_doc_base.jsonl --new per_doc_new.jsonl
+    python score.py compare --base seed0.jsonl,seed1.jsonl --new seed0.jsonl,seed1.jsonl
+    (compare takes per-doc files written by `score`; several seeds per side are pooled)
 """
 
 import argparse
 import json
 import math
 import os
-import random
 import re
 import sys
 from functools import lru_cache
 
+import numpy as np
 from rdkit import Chem, DataStructs, RDLogger, __version__ as RDKIT_VERSION
 from rdkit.Chem import rdFingerprintGenerator
 from rdkit.Chem.MolStandardize import rdMolStandardize
@@ -46,9 +50,13 @@ RDLogger.DisableLog("rdApp.*")
 RDKIT_PIN = "2026.09.1"  # canonicalization changes between RDKit releases; scores are only comparable on one version
 W_STRUCT = 0.5          # weight of structure F1 in the composite score
 W_RECORD = 0.5          # weight of record F1 (structure + value correctly linked)
-VALUE_REL_TOL = 1e-3    # relative tolerance after unit normalization
+VALUE_REL_TOL = 1e-3    # relative tolerance when gold and prediction use the same scale
+LOG_TOL_CONVERTED = 0.05  # log10 tolerance when one side converted pX <-> molar (rounding)
 STRIP_SALTS = True      # compare parent compounds (largest fragment, neutralized)
 MATCH_TARGET = True     # a record must also name the right target
+MAX_HEAVY_ATOMS = 500   # larger predicted structures are invalid (keeps scoring time bounded)
+MAX_PRED_COMPOUNDS = 5000   # per document; the rest count as invalid predictions
+MAX_PRED_RECORDS = 20000    # per document; the rest count as false positives
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 0
 
@@ -58,6 +66,25 @@ BOOTSTRAP_SEED = 0
 
 _morgan = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 _uncharger = rdMolStandardize.Uncharger()
+_salt_remover = rdMolStandardize.FragmentRemover()
+_GENERIC_LABELS = {"X": 90, "Y": 91, "Z": 92, "A": 93, "Ar": 94, "Het": 95, "Alk": 96, "Q": 97, "G": 98}
+_DUMMY_PROPS = ("atomLabel", "dummyLabel", "_MolFileRLabel")
+
+
+def _rlabel_number(atom):
+    """R-group number of a dummy atom from [1*], [*:1], CXSMILES/molfile labels; 0 for a bare '*'."""
+    if atom.GetIsotope():
+        return atom.GetIsotope()
+    if atom.GetAtomMapNum():
+        return atom.GetAtomMapNum()
+    props = atom.GetPropsAsDict(includePrivate=True, includeComputed=False)
+    if props.get("_MolFileRLabel"):
+        return int(props["_MolFileRLabel"])
+    label = str(props.get("atomLabel") or props.get("dummyLabel") or "*")
+    m = re.fullmatch(r"_?R(\d+)", label)
+    if m:
+        return int(m.group(1))
+    return _GENERIC_LABELS.get(label.lstrip("_"), 0 if label in ("*", "R", "_R") else 99)
 
 
 @lru_cache(maxsize=200_000)
@@ -69,39 +96,67 @@ def _standardize(smiles):
     if mol is None:
         return None
     try:
+        mol = Chem.RWMol(mol)
+        for atom in mol.GetAtoms():
+            if atom.GetAtomicNum() == 0:   # one spelling for every R-label convention
+                n = _rlabel_number(atom)
+                for prop in _DUMMY_PROPS:
+                    if atom.HasProp(prop):
+                        atom.ClearProp(prop)
+                atom.SetIsotope(n)
+            atom.SetAtomMapNum(0)
+        mol = mol.GetMol()
         if STRIP_SALTS:
             mol = rdMolStandardize.FragmentParent(mol)
             mol = _uncharger.uncharge(mol)
         else:
             mol = rdMolStandardize.Cleanup(mol)
-        # round-trip through CXSMILES so ring info / sanitization state is fresh
+        # round-trip through canonical CXSMILES: fresh ring info, canonical enhanced-stereo groups
         mol = Chem.MolFromSmiles(Chem.MolToCXSmiles(mol))
     except Exception:
+        return None
+    if mol is None or mol.GetNumHeavyAtoms() > MAX_HEAVY_ATOMS:
         return None
     return mol
 
 
 @lru_cache(maxsize=200_000)
-def structure_key(smiles):
+def structure_keys(smiles):
     """
-    Identity key for exact-match scoring. Standard InChIKey (stereo-aware) for
-    ordinary molecules; canonical CXSMILES for Markush/R-group structures,
-    which InChI cannot represent. Returns None for invalid input.
+    -> (key, skeleton) used for exact matching, or (None, None) for invalid input.
+    key: standard InChIKey (stereo-aware) for ordinary molecules; canonical CXSMILES for
+    Markush/R-group structures (InChI cannot represent them) and for racemic/relative
+    (enhanced) stereo, which standard InChI does not distinguish from absolute stereo.
+    skeleton: the same identity with stereochemistry removed (diagnostics only).
     """
     mol = _standardize(smiles)
     if mol is None:
-        return None
+        return None, None
     if any(atom.GetAtomicNum() == 0 for atom in mol.GetAtoms()):
-        return "CXSMILES:" + Chem.MolToCXSmiles(mol)
-    key = Chem.MolToInchiKey(mol)
-    return key or "SMILES:" + Chem.MolToSmiles(mol)
+        flat = Chem.Mol(mol)
+        Chem.RemoveStereochemistry(flat)
+        return "MARKUSH:" + Chem.MolToCXSmiles(mol), "MARKUSH:" + Chem.MolToSmiles(flat)
+    inchikey = Chem.MolToInchiKey(mol)
+    if not inchikey:
+        flat = Chem.Mol(mol)
+        Chem.RemoveStereochemistry(flat)
+        return "SMILES:" + Chem.MolToCXSmiles(mol), "SMILES:" + Chem.MolToSmiles(flat)
+    if any(g.GetGroupType() != Chem.StereoGroupType.STEREO_ABSOLUTE for g in mol.GetStereoGroups()):
+        return "CXSMILES:" + Chem.MolToCXSmiles(mol), inchikey.split("-")[0]
+    return inchikey, inchikey.split("-")[0]
 
 
-def skeleton_key(key):
-    """Stereo/isotope-insensitive key (InChIKey connectivity block) for diagnostics."""
-    if key is None or "-" not in key or ":" in key:
-        return key
-    return key.split("-")[0]
+def structure_key(smiles):
+    return structure_keys(smiles)[0]
+
+
+@lru_cache(maxsize=200_000)
+def is_multifragment(smiles):
+    """True if a structure still has several fragments after removing known salts/solvents."""
+    mol = Chem.MolFromSmiles(smiles.strip()) if isinstance(smiles, str) and smiles.strip() else None
+    if mol is None:
+        return False
+    return len(Chem.GetMolFrags(_salt_remover.remove(mol))) > 1
 
 
 @lru_cache(maxsize=200_000)
@@ -167,11 +222,12 @@ def _to_canonical(value, unit):
 
 def normalize_measurement(m):
     """
-    -> (endpoint, target, relation, unit_class, condition, values) with values (a tuple of
-    one number, or (lo, hi) for a range) in a canonical unit; None if the value is not
-    numeric. Molar concentrations go to nM, times to hours, p-values (pIC50 etc.) are
-    converted to nM with the relation flipped. `condition` is the test concentration of
-    single-dose endpoints such as % inhibition (canonical units, 4 significant figures).
+    -> (endpoint, target, relation, unit_class, condition, values, from_p), or None if the
+    value is not numeric. `values` is one number, or (lo, hi) for a range, in a canonical
+    unit: molar concentrations in nM, times in hours; p-values (pIC50 etc.) are converted
+    to nM with the relation flipped and `from_p` set, so that a pX printed in the paper and
+    a molar value converted by the model can still match within rounding. `condition` is
+    the test concentration of single-dose endpoints such as % inhibition.
     """
     raw = m.get("value")
     try:
@@ -183,7 +239,8 @@ def normalize_measurement(m):
     endpoint = _norm_endpoint(m.get("endpoint"))
     target = _norm_text(m.get("target")) if MATCH_TARGET else ""
     relation = "range" if len(values) == 2 else _RELATIONS.get(str(m.get("relation") or "").strip(), "?")
-    if endpoint in _P_ENDPOINTS and _norm_unit(m.get("unit")) == "":
+    from_p = endpoint in _P_ENDPOINTS and _norm_unit(m.get("unit")) == ""
+    if from_p:
         endpoint, unit_class = _P_ENDPOINTS[endpoint], "molar"
         values, relation = tuple(10.0 ** (9.0 - v) for v in values), _FLIP.get(relation, relation)
     else:
@@ -197,7 +254,7 @@ def normalize_measurement(m):
             condition = f"{cls}:{cval:.4g}"
         except (TypeError, ValueError):
             condition = "?"
-    return endpoint, target, relation, unit_class, condition, values
+    return endpoint, target, relation, unit_class, condition, values, from_p
 
 # ---------------------------------------------------------------------------
 # Per-document scoring
@@ -210,15 +267,15 @@ def _norm_label(s):
     return re.sub(r"[^0-9a-z]+", "", s)
 
 
-def _compound_table(doc):
-    """compound id -> smiles, plus the list of all smiles in the document."""
-    table, all_smiles = {}, []
-    for c in doc.get("compounds") or []:
-        smi = c.get("smiles")
-        all_smiles.append(smi)
-        if c.get("id") is not None:
-            table[_norm_label(c["id"])] = smi
-    return table, all_smiles
+def _capped(items, cap):
+    """Items beyond the cap are kept as empty placeholders: they count, but are never valid."""
+    items = list(items or [])
+    return items[:cap] + [{}] * max(0, len(items) - cap)
+
+
+def _compound_table(compounds):
+    """compound id -> smiles."""
+    return {_norm_label(c["id"]): c.get("smiles") for c in compounds if c.get("id") is not None}
 
 
 def _multiset_tp(gold_keys, pred_keys):
@@ -233,10 +290,10 @@ def _multiset_tp(gold_keys, pred_keys):
     return tp
 
 
-def _records(doc, table, by_label):
-    """Measurements -> list of (key_tuple, values). Unresolvable records keep key None."""
+def _records(measurements, table, by_label):
+    """Measurements -> list of (key_tuple, (values, from_p)). Unresolvable records keep key None."""
     out = []
-    for m in doc.get("measurements") or []:
+    for m in measurements:
         norm = normalize_measurement(m)
         cid = _norm_label(m.get("compound_id"))
         if by_label:
@@ -246,19 +303,24 @@ def _records(doc, table, by_label):
         if norm is None or ckey is None:
             out.append((None, None))
             continue
-        *fields, values = norm
-        out.append(((ckey, *fields), values))
+        *fields, values, from_p = norm
+        out.append(((ckey, *fields), (values, from_p)))
     return out
 
 
-def _close(a, b):
-    return len(a) == len(b) and all(math.isclose(x, y, rel_tol=VALUE_REL_TOL, abs_tol=1e-12) for x, y in zip(a, b))
+def _close(gold, pred):
+    (gv, gp), (pv, pp) = gold, pred
+    if len(gv) != len(pv):
+        return False
+    if gp != pp:   # one side was converted between pX and molar: allow rounding
+        return all(g > 0 and p > 0 and abs(math.log10(g) - math.log10(p)) <= LOG_TOL_CONVERTED for g, p in zip(gv, pv))
+    return all(math.isclose(g, p, rel_tol=VALUE_REL_TOL, abs_tol=1e-12) for g, p in zip(gv, pv))
 
 
 def _record_tp(gold_recs, pred_recs):
     """
-    Maximum one-to-one matching. Within one key, tolerance windows are order-preserving
-    intervals on the value line, so a sorted sweep gives the optimum.
+    One-to-one matching within each record key. Tolerance windows are order-preserving
+    intervals on the value line, so a sorted sweep gives the maximum matching.
     """
     groups = {}
     for k, v in gold_recs:
@@ -283,40 +345,49 @@ def _record_tp(gold_recs, pred_recs):
 
 def score_document(gold, pred):
     """Returns a dict of additive counts for one document (micro-averaged later)."""
-    g_table, g_smiles = _compound_table(gold)
-    p_table, p_smiles = _compound_table(pred)
-    g_keys = [structure_key(s) for s in g_smiles]
-    p_keys = [structure_key(s) for s in p_smiles]
-    p_valid = [k for k in p_keys if k is not None]
-    g_valid = [k for k in g_keys if k is not None]
-    struct_tp = _multiset_tp(g_valid, p_valid)
+    g_compounds = list(gold.get("compounds") or [])
+    p_compounds = _capped(pred.get("compounds"), MAX_PRED_COMPOUNDS)
+    p_measurements = _capped(pred.get("measurements"), MAX_PRED_RECORDS)
+    g_table, p_table = _compound_table(g_compounds), _compound_table(p_compounds)
+    g_smiles = [c.get("smiles") for c in g_compounds]
+    p_smiles = [c.get("smiles") for c in p_compounds]
+    g_keys = [structure_keys(s) for s in g_smiles]
+    p_keys = [structure_keys(s) for s in p_smiles]
+    g_valid = [k for k in g_keys if k[0] is not None]
+    p_valid = [k for k in p_keys if k[0] is not None]
+    struct_tp = _multiset_tp([k for k, _ in g_valid], [k for k, _ in p_valid])
     # Predictions for unscorable gold structures (e.g. drawings SMILES cannot express)
     # are excluded from precision just as the gold side is excluded from recall.
     n_gold_unscorable = len(g_keys) - len(g_valid)
     n_pred_struct = len(p_keys) - min(n_gold_unscorable, len(p_keys) - struct_tp)
     tanimoto_sum = sum(max((tanimoto(gs, ps) for ps in p_smiles), default=0.0)
-                       for gs, gk in zip(g_smiles, g_keys) if gk is not None)
-    g_recs = _records(gold, g_table, by_label=False)
-    p_recs = _records(pred, p_table, by_label=False)
-    g_recs_label = _records(gold, g_table, by_label=True)
-    p_recs_label = _records(pred, p_table, by_label=True)
+                       for gs, gk in zip(g_smiles, g_keys) if gk[0] is not None)
+    g_ids = [(_norm_label(c["id"]), k[0]) for c, k in zip(g_compounds, g_keys) if c.get("id") is not None and k[0]]
+    p_ids = [(_norm_label(c["id"]), k[0]) for c, k in zip(p_compounds, p_keys) if c.get("id") is not None]
+    g_measurements = list(gold.get("measurements") or [])
+    g_recs = _records(g_measurements, g_table, by_label=False)
+    p_recs = _records(p_measurements, p_table, by_label=False)
     return {
         "doc_id": gold.get("doc_id"),
         "family_id": gold.get("family_id") or gold.get("doc_id"),
         "slice": gold.get("slice") or "all",
         "n_gold_unscorable": n_gold_unscorable,
         "struct_tp": struct_tp,
-        "struct_tp_skeleton": _multiset_tp([skeleton_key(k) for k in g_valid], [skeleton_key(k) for k in p_valid]),
+        "struct_tp_skeleton": _multiset_tp([s for _, s in g_valid], [s for _, s in p_valid]),
         "n_gold_struct": len(g_valid),
         "n_pred_struct": n_pred_struct,
         "n_invalid_struct": len(p_keys) - len(p_valid),
+        "n_multifrag_struct": sum(1 for s in p_smiles if is_multifragment(s)),
         "tanimoto_sum": tanimoto_sum,
+        "id_link_tp": _multiset_tp(g_ids, p_ids),
+        "n_gold_id": len(g_ids),
+        "n_pred_id": len(p_ids),
         "record_tp": _record_tp(g_recs, p_recs),
-        "record_tp_label": _record_tp(g_recs_label, p_recs_label),
+        "record_tp_label": _record_tp(_records(g_measurements, g_table, by_label=True),
+                                      _records(p_measurements, p_table, by_label=True)),
         "n_gold_rec": sum(1 for k, _ in g_recs if k is not None),
         "n_pred_rec": len(p_recs),
-        "n_orphan_rec": sum(1 for m in pred.get("measurements") or []
-                            if _norm_label(m.get("compound_id")) not in p_table),
+        "n_orphan_rec": sum(1 for m in p_measurements if _norm_label(m.get("compound_id")) not in p_table),
     }
 
 # ---------------------------------------------------------------------------
@@ -324,91 +395,130 @@ def score_document(gold, pred):
 # ---------------------------------------------------------------------------
 
 _ID_FIELDS = ("doc_id", "family_id", "slice")
+SCALARS = ("auto", "composite", "struct_f1", "record_f1")
+
+
+def _ratio(a, b):
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    return np.divide(a, b, out=np.zeros(np.broadcast(a, b).shape), where=b > 0)
 
 
 def _f1(tp, n_pred, n_gold):
-    p = tp / n_pred if n_pred else 0.0
-    r = tp / n_gold if n_gold else 0.0
-    return (2 * p * r / (p + r) if p + r else 0.0), p, r
+    p, r = _ratio(tp, n_pred), _ratio(tp, n_gold)
+    return _ratio(2 * p * r, p + r), p, r
 
 
-def aggregate(per_doc):
+def resolve_scalar(per_doc, scalar="auto"):
+    """'auto' = composite if the gold has any measurement records, else structure F1."""
+    assert scalar in SCALARS, scalar
+    if scalar != "auto":
+        return scalar
+    return "composite" if sum(d["n_gold_rec"] for d in per_doc) > 0 else "struct_f1"
+
+
+def _scalar_from(tot, scalar):
+    """Primary scalar from totals (works elementwise on bootstrap arrays)."""
+    struct_f1 = _f1(tot["struct_tp"], tot["n_pred_struct"], tot["n_gold_struct"])[0]
+    record_f1 = _f1(tot["record_tp"], tot["n_pred_rec"], tot["n_gold_rec"])[0]
+    return {"struct_f1": struct_f1, "record_f1": record_f1,
+            "composite": W_STRUCT * struct_f1 + W_RECORD * record_f1}[scalar]
+
+
+def _totals(per_doc):
     tot = {}
     for d in per_doc:
         for k, v in d.items():
             if k not in _ID_FIELDS:
                 tot[k] = tot.get(k, 0) + v
+    return tot
+
+
+def aggregate(per_doc, scalar="auto"):
+    mode = resolve_scalar(per_doc, scalar) if per_doc else "struct_f1"
+    tot = _totals(per_doc)
     get = lambda k: tot.get(k, 0)
     struct_f1, struct_p, struct_r = _f1(get("struct_tp"), get("n_pred_struct"), get("n_gold_struct"))
-    skel_f1, _, _ = _f1(get("struct_tp_skeleton"), get("n_pred_struct"), get("n_gold_struct"))
     rec_f1, rec_p, rec_r = _f1(get("record_tp"), get("n_pred_rec"), get("n_gold_rec"))
-    rec_label_f1, _, _ = _f1(get("record_tp_label"), get("n_pred_rec"), get("n_gold_rec"))
-    has_records = get("n_gold_rec") > 0
-    score = W_STRUCT * struct_f1 + W_RECORD * rec_f1 if has_records else struct_f1
-    return {
-        "score": score,
+    out = {
+        "score": _scalar_from({k: get(k) for k in ("struct_tp", "n_pred_struct", "n_gold_struct",
+                                                   "record_tp", "n_pred_rec", "n_gold_rec")}, mode),
         "struct_f1": struct_f1,
         "struct_precision": struct_p,
         "struct_recall": struct_r,
-        "struct_f1_nostereo": skel_f1,
-        "struct_tanimoto": get("tanimoto_sum") / get("n_gold_struct") if get("n_gold_struct") else 0.0,
-        "invalid_smiles_rate": get("n_invalid_struct") / get("n_pred_struct") if get("n_pred_struct") else 0.0,
+        "struct_f1_nostereo": _f1(get("struct_tp_skeleton"), get("n_pred_struct"), get("n_gold_struct"))[0],
+        "struct_tanimoto": _ratio(get("tanimoto_sum"), get("n_gold_struct")),
+        "invalid_smiles_rate": _ratio(get("n_invalid_struct"), get("n_pred_struct")),
+        "multifragment_rate": _ratio(get("n_multifrag_struct"), get("n_pred_struct")),
+        "id_link_f1": _f1(get("id_link_tp"), get("n_pred_id"), get("n_gold_id"))[0],
         "record_f1": rec_f1,
         "record_precision": rec_p,
         "record_recall": rec_r,
-        "record_f1_by_label": rec_label_f1,
-        "orphan_record_rate": get("n_orphan_rec") / get("n_pred_rec") if get("n_pred_rec") else 0.0,
-        "n_docs": len(per_doc),
-        "n_gold_struct": get("n_gold_struct"),
-        "n_gold_unscorable": get("n_gold_unscorable"),
-        "n_gold_rec": get("n_gold_rec"),
+        "record_f1_by_label": _f1(get("record_tp_label"), get("n_pred_rec"), get("n_gold_rec"))[0],
+        "orphan_record_rate": _ratio(get("n_orphan_rec"), get("n_pred_rec")),
     }
+    out = {k: float(v) for k, v in out.items()}
+    out.update({"scalar": mode, "n_docs": len(per_doc), "n_gold_struct": get("n_gold_struct"),
+                "n_gold_unscorable": get("n_gold_unscorable"), "n_gold_rec": get("n_gold_rec")})
+    return out
 
 
-def _clusters(per_doc):
+def _cluster_totals(per_doc, cluster_order=None):
+    """-> (cluster ids, {field: array of per-cluster totals})."""
     groups = {}
     for d in per_doc:
-        groups.setdefault(d.get("family_id") or d.get("doc_id"), []).append(d)
-    return list(groups.values())
+        groups.setdefault(d.get("family_id") or d["doc_id"], []).append(d)
+    order = cluster_order or sorted(groups)
+    fields = [k for k in per_doc[0] if k not in _ID_FIELDS]
+    return order, {f: np.array([sum(d[f] for d in groups.get(c, [])) for c in order], dtype=float) for f in fields}
 
 
-def _percentile_ci(samples, alpha):
-    samples = sorted(samples)
-    n = len(samples)
-    return samples[int(alpha / 2 * n)], samples[min(n - 1, int((1 - alpha / 2) * n))]
+def _bootstrap_scores(cols, weights, scalar):
+    """Scalar for every bootstrap replicate: weights is (replicates x clusters) resampling counts."""
+    return _scalar_from({f: weights @ v for f, v in cols.items()}, scalar)
 
 
-def bootstrap_ci(per_doc, alpha=0.05):
-    """Percentile CI of the composite score, resampling patent families / articles (clusters)."""
-    rng = random.Random(BOOTSTRAP_SEED)
-    clusters = _clusters(per_doc)
-    scores = []
-    for _ in range(BOOTSTRAP_SAMPLES):
-        sample = [d for _ in clusters for d in clusters[rng.randrange(len(clusters))]]
-        scores.append(aggregate(sample)["score"])
-    return _percentile_ci(scores, alpha)
+def _weights(n_clusters):
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    return rng.multinomial(n_clusters, np.full(n_clusters, 1.0 / n_clusters), size=BOOTSTRAP_SAMPLES).astype(float)
 
 
-def paired_compare(base, new, alpha=0.10):
+def bootstrap_ci(per_doc, alpha=0.05, scalar="auto"):
+    """Percentile CI of the primary scalar, resampling patent families / articles (clusters)."""
+    mode = resolve_scalar(per_doc, scalar)
+    order, cols = _cluster_totals(per_doc)
+    scores = _bootstrap_scores(cols, _weights(len(order)), mode)
+    return float(np.quantile(scores, alpha / 2)), float(np.quantile(scores, 1 - alpha / 2))
+
+
+def paired_compare(base, new, alpha=0.10, scalar="auto"):
     """Paired cluster bootstrap over shared doc_ids: delta = score(new) - score(base)."""
     b = {d["doc_id"]: d for d in base}
     n = {d["doc_id"]: d for d in new}
     ids = sorted(set(b) & set(n))
     assert ids, "no shared doc_ids between the two runs"
-    clusters = {}
-    for i in ids:
-        clusters.setdefault(b[i].get("family_id") or i, []).append(i)
-    clusters = [clusters[k] for k in sorted(clusters)]
-    delta = aggregate([n[i] for i in ids])["score"] - aggregate([b[i] for i in ids])["score"]
-    rng = random.Random(BOOTSTRAP_SEED)
-    deltas = []
-    for _ in range(BOOTSTRAP_SAMPLES):
-        sample = [i for _ in clusters for i in clusters[rng.randrange(len(clusters))]]
-        deltas.append(aggregate([n[i] for i in sample])["score"] - aggregate([b[i] for i in sample])["score"])
-    lo, hi = _percentile_ci(deltas, alpha)
-    p_not_better = sum(1 for d in deltas if d <= 0) / BOOTSTRAP_SAMPLES
-    return {"delta": delta, "ci_lo": lo, "ci_hi": hi, "p_not_better": p_not_better,
-            "n_shared": len(ids), "n_clusters": len(clusters)}
+    base_docs, new_docs = [b[i] for i in ids], [n[i] for i in ids]
+    mode = resolve_scalar(base_docs, scalar)
+    order, base_cols = _cluster_totals(base_docs)
+    _, new_cols = _cluster_totals([dict(d, family_id=b[d["doc_id"]].get("family_id")) for d in new_docs], order)
+    delta = float(aggregate(new_docs, mode)["score"] - aggregate(base_docs, mode)["score"])
+    w = _weights(len(order))
+    deltas = _bootstrap_scores(new_cols, w, mode) - _bootstrap_scores(base_cols, w, mode)
+    return {"delta": delta, "ci_lo": float(np.quantile(deltas, alpha / 2)),
+            "ci_hi": float(np.quantile(deltas, 1 - alpha / 2)),
+            "p_not_better": float(np.mean(deltas <= 0)), "n_shared": len(ids), "n_clusters": len(order),
+            "scalar": mode}
+
+
+def pool_seeds(runs):
+    """Several per-doc files of the same recipe (different seeds) -> one per-doc list of summed counts."""
+    pooled = {}
+    for run in runs:
+        for d in run:
+            p = pooled.setdefault(d["doc_id"], {k: d[k] for k in _ID_FIELDS if k in d})
+            for k, v in d.items():
+                if k not in _ID_FIELDS:
+                    p[k] = p.get(k, 0) + v
+    return list(pooled.values())
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -459,9 +569,11 @@ def main():
     s.add_argument("--gold", required=True)
     s.add_argument("--pred", required=True)
     s.add_argument("--per-doc-out", default=None)
+    s.add_argument("--scalar", choices=SCALARS, default="auto")
     c = sub.add_parser("compare")
-    c.add_argument("--base", required=True)
-    c.add_argument("--new", required=True)
+    c.add_argument("--base", required=True, help="per-doc file(s), comma-separated seeds")
+    c.add_argument("--new", required=True, help="per-doc file(s), comma-separated seeds")
+    c.add_argument("--scalar", choices=SCALARS, default="auto")
     args = parser.parse_args()
     _check_rdkit()
 
@@ -471,8 +583,8 @@ def main():
             with open(args.per_doc_out, "w") as f:
                 for d in per_doc:
                     f.write(json.dumps(d) + "\n")
-        summary = aggregate(per_doc)
-        lo, hi = bootstrap_ci(per_doc)
+        summary = aggregate(per_doc, args.scalar)
+        lo, hi = bootstrap_ci(per_doc, scalar=args.scalar)
         print("---")
         for k, v in summary.items():
             print(f"{k + ':':22s}{v:.6f}" if isinstance(v, float) else f"{k + ':':22s}{v}")
@@ -482,16 +594,18 @@ def main():
         slices = sorted({d["slice"] for d in per_doc})
         if len(slices) > 1:
             for name in slices:
-                sl = aggregate([d for d in per_doc if d["slice"] == name])
+                sl = aggregate([d for d in per_doc if d["slice"] == name], summary["scalar"])
                 print(f"{'slice/' + name + ':':22s}score={sl['score']:.6f} n_docs={sl['n_docs']}")
     else:
-        r = paired_compare(_read_jsonl(args.base)[0], _read_jsonl(args.new)[0])
+        load = lambda spec: pool_seeds([_read_jsonl(p)[0] for p in spec.split(",")])
+        r = paired_compare(load(args.base), load(args.new), scalar=args.scalar)
         print("---")
         print(f"{'delta:':22s}{r['delta']:+.6f}")
         print(f"{'delta_ci90:':22s}[{r['ci_lo']:+.6f}, {r['ci_hi']:+.6f}]")
         print(f"{'p_not_better:':22s}{r['p_not_better']:.4f}")
         print(f"{'n_shared_docs:':22s}{r['n_shared']}")
         print(f"{'n_clusters:':22s}{r['n_clusters']}")
+        print(f"{'scalar:':22s}{r['scalar']}")
 
 
 if __name__ == "__main__":
