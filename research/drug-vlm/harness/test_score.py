@@ -722,7 +722,8 @@ rgroups:
                             ("4-F-Ph", "O=C(O)c1ccc(F)cc1"), ("3-OMe-phenyl", "COc1cccc(C(=O)O)c1"),
                             ("4-cPr-Ph", "O=C(O)c1ccc(C2CC2)cc1"), ("3-cPr-Ph", "O=C(O)c1cccc(C2CC2)c1"),
                             ("4-Ph-Ph", "O=C(O)c1ccc(-c2ccccc2)cc1"), ("4-OPh-Ph", "O=C(O)c1ccc(Oc2ccccc2)cc1"),
-                            ("2-cPr-Ph", "O=C(O)c1ccccc1C1CC1"),
+                            ("2-cPr-Ph", "O=C(O)c1ccccc1C1CC1"), ("－OMe", "COC(=O)O"), ("—CH3", "CC(=O)O"),
+                            ("SCN", "N#CSC(=O)O"), ("COCl", "O=C(O)C(=O)Cl"),
                             ("-OCH3", "COC(=O)O"), ("[*]C#N", "N#CC(=O)O")):
             self.assertEqual(score.structure_key(acid(r)), score.structure_key(expected), r)
 
@@ -755,6 +756,43 @@ rgroups:
         self.assertEqual(score.structure_key(smiles["4"]), score.structure_key("Fc1ccccc1"))   # filled in by T3
         self.assertIsNone(docs[0]["measurements"][0]["compound_id"])                          # unlabeled: unlinked
         self.assertTrue(any("not mappings" in w for w in warnings))
+
+    def test_ambiguous_abbreviation_is_refused(self):
+        import yaml_to_jsonl
+        cid, smiles, problem = yaml_to_jsonl.enumerate_rows("[*:1]C(=O)O", [{"compound_id": "x", "R1": "NC"}])[0]
+        self.assertIsNone(smiles)
+        self.assertIn("ambiguous", problem)
+
+    def test_repeated_blocks_unlabeled_compounds_and_bad_doc_ids(self):
+        import os, tempfile
+        try:
+            import yaml_to_jsonl
+        except SystemExit:
+            self.skipTest("PyYAML not installed")
+        text = """table: {doc_id: "D5"}
+records:
+  - {compound_id: "1", endpoint: "IC50", target: "EGFR", value: "3", unit: "nM"}
+legend: {"A": "<10 nM"}
+records:
+  - {compound_id: "1", endpoint: "IC50", target: "KDR", value: "40", unit: "nM"}
+compounds:
+  - {smiles: "CCO"}
+  - {compound_id: "1", smiles: "CCN", compound_id: "1"}
+---
+table: {doc_id: ["D6", "D7"]}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "dup.yaml")
+            with open(path, "w") as f:
+                f.write(text)
+            warnings = []
+            docs = yaml_to_jsonl.convert(yaml_to_jsonl.load([path], warn=warnings.append), warn=warnings.append)
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(len(docs[0]["measurements"]), 2)                  # both records blocks kept
+        self.assertEqual(sorted(c["smiles"] for c in docs[0]["compounds"]), ["CCN", "CCO"])  # unlabeled kept
+        self.assertTrue(any("merged" in w for w in warnings))
+        self.assertTrue(any("repeated key 'compound_id'" in w for w in warnings))
+        self.assertTrue(any("not a string" in w for w in warnings))
 
     def test_invalid_yaml_file_is_skipped(self):
         import os, tempfile
@@ -850,6 +888,11 @@ class FileScoringTests(unittest.TestCase):
                     f.write(json.dumps(bad) + "\n")
                 with self.assertRaisesRegex(ValueError, pattern):
                     score.score_files(gold_path, pred_path)
+            # empty or null YAML-style keys next to a measurements key are not an error
+            ok = dict(doc([{"id": "12a", "smiles": ASPIRIN}], []), records=[], scaffold=None)
+            with open(pred_path, "w") as f:
+                f.write(json.dumps(ok) + "\n")
+            score.score_files(gold_path, pred_path)
 
     def test_schema_relation_cat_matches_a_printed_binned_value(self):
         gold = doc([{"id": "1", "smiles": ASPIRIN}], [dict(meas("1", "A", unit=""), relation="cat")])

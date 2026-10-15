@@ -21,7 +21,10 @@ in record_f1.
 All YAML scalars are read as strings, so values keep their printed form ("12.30" stays "12.30").
 The older key `compound` is accepted for `compound_id` (with a warning). A value that is a
 legend key gets the legend text in `bin` (ignored by the scorer, kept for the deliverable).
-A file that is not valid YAML is skipped with a warning (its documents score as missing).
+A file that is not valid YAML is skipped with a warning (its documents score as missing); a
+repeated records/rgroups/compounds block is merged and any other repeated key is reported. A
+compound without a usable label is kept unlabeled (its structure still counts). Ambiguous labels
+such as "NC" are refused rather than guessed; a leading dash of any width ("－OMe") is the bond.
 
 Usage: python yaml_to_jsonl.py tables/*.yaml > pred.jsonl
 """
@@ -30,6 +33,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 try:
     import yaml
@@ -71,12 +75,47 @@ _ABBREVIATIONS = {
     "SCH3": "*SC", "NHCH3": "*NC", "N(CH3)2": "*N(C)C", "CH2OH": "*CO", "CH2NH2": "*CN", "COCH3": "*C(C)=O",
     "CO2CH3": "*C(=O)OC", "COOCH3": "*C(=O)OC", "CO2C2H5": "*C(=O)OCC", "SO2CH3": "*S(C)(=O)=O",
     "NHCOCH3": "*NC(C)=O", "CH2Ph": "*Cc1ccccc1", "C6H5": "*c1ccccc1",
+    # pseudohalides and acyl halides: valid SMILES as written, but with another meaning
+    "SCN": "*SC#N", "NCS": "*N=C=S", "OCN": "*OC#N", "NCO": "*N=C=O", "COCl": "*C(=O)Cl",
 }
+# Labels with two common readings are refused rather than guessed ('NC': cyano drawn from the
+# left, isocyano, or methylamino as SMILES).
+_AMBIGUOUS = {"NC"}
+_DASHES = "-‐‑‒–—−﹣－"
 _PHENYL = re.compile(r"^([234])-([A-Za-z0-9()]+?)-?(?:Ph|phenyl|C6H4)$")
 # Ring-closure label %99 is never used in the table above, so a substituent with its own ring
 # ('4-cPr-Ph', '4-OPh-Ph') cannot close the phenyl ring early into a fused bicycle.
 _RING_POSITION = {"2": "*c%99ccccc%99{}", "3": "*c%99cccc({})c%99", "4": "*c%99ccc({})cc%99"}
 _ROW_META = {"compound_id", "compound", "label", "id", "smiles", "name"}
+_LIST_KEYS = {"records", "rgroups", "compounds"}
+
+
+class _Loader(yaml.BaseLoader):
+    """BaseLoader (every scalar a string) that does not silently drop repeated keys: a repeated
+    records/rgroups/compounds list is concatenated, any other repeated key is reported."""
+
+    def __init__(self, stream):
+        super().__init__(stream)
+        self.notes = []
+
+    def construct_mapping(self, node, deep=False):
+        if not isinstance(node, yaml.MappingNode):
+            return super().construct_mapping(node, deep=deep)
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=True)
+            value = self.construct_object(value_node, deep=True)
+            if isinstance(key, (list, dict)):
+                key = json.dumps(key)
+            if key in mapping:
+                line = key_node.start_mark.line + 1
+                if key in _LIST_KEYS and isinstance(mapping[key], list) and isinstance(value, list):
+                    mapping[key] = mapping[key] + value
+                    self.notes.append(f"line {line}: repeated '{key}' block merged with the earlier one")
+                    continue
+                self.notes.append(f"line {line}: repeated key '{key}', the last value is kept")
+            mapping[key] = value
+        return mapping
 
 
 def _null(x):
@@ -117,7 +156,10 @@ def _abbreviation(text):
 
 def _fragment(text, n):
     """R-group text -> mol with exactly one dummy atom, mapped to n; None if unreadable."""
-    t = str(text).strip().lstrip("-–")   # '-F', '–OMe': the bond to the scaffold, not part of the group
+    # '-F', '－OMe': the dash is the bond to the scaffold, not part of the group
+    t = unicodedata.normalize("NFKC", str(text)).strip().lstrip(_DASHES).strip()
+    if t in _AMBIGUOUS:
+        return None
     if t in ("H", "[H]"):
         t = "[H][*]"
     t = _abbreviation(t) or t
@@ -181,7 +223,9 @@ def enumerate_rows(scaffold_smiles, rows):
             for n in maps:
                 frag = _fragment(given[name], n)
                 if frag is None:
-                    bad = f"{name} = {given[name]!r} is not a fragment or known abbreviation"
+                    reason = "is ambiguous" if str(given[name]).strip() in _AMBIGUOUS else \
+                        "is not a fragment or known abbreviation"
+                    bad = f"{name} = {given[name]!r} {reason}"
                     break
                 combo = Chem.CombineMols(combo, frag)
             if bad:
@@ -227,8 +271,8 @@ def convert(tables, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
             continue
         head = table.get("table") if isinstance(table.get("table"), dict) else {}
         doc_id = head.get("doc_id") or table.get("doc_id")
-        if _null(doc_id):
-            warn(f"table {t_index}: no doc_id, skipped")
+        if _null(doc_id) or not isinstance(doc_id, str):
+            warn(f"table {t_index}: no doc_id, or doc_id is not a string; skipped")
             continue
         where = f"{doc_id} {head.get('table_id') or ''}".strip()
         doc = docs.setdefault(doc_id, {"doc_id": doc_id, "compounds": [], "measurements": []})
@@ -236,8 +280,9 @@ def convert(tables, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
 
         def add(cid, smiles):
             key = _norm_label(cid)
-            if not key:
-                warn(f"{where}: a compound without a usable compound_id ({cid!r}) was dropped")
+            if not key:   # kept: the scorer credits a structure without a label, it just links nothing
+                warn(f"{where}: a compound without a usable compound_id ({cid!r}) is kept unlabeled")
+                doc["compounds"].append({"id": cid, "smiles": smiles})
                 return
             if key in index:
                 old = index[key]
@@ -283,7 +328,16 @@ def load(paths, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
     for path in paths:
         try:
             with open(path, encoding="utf-8") as f:
-                tables.extend(list(yaml.load_all(f, Loader=yaml.BaseLoader)))
+                loader = _Loader(f.read())
+            docs = []
+            try:
+                while loader.check_data():
+                    docs.append(loader.get_data())
+            finally:
+                loader.dispose()
+            tables.extend(docs)
+            for note in loader.notes:
+                warn(f"{path}: {note}")
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             warn(f"{path}: not valid YAML, skipped ({getattr(e, 'problem', None) or e})")
     return tables

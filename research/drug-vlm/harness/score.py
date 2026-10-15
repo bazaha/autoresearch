@@ -1533,10 +1533,18 @@ def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None, req
     # run-to-run noise, which the paired document resampling already counts.
     nb, nn = len(base_runs), len(new_runs)
     multi = new_m if nb == 1 < nn else base_m if nn == 1 < nb else None
-    z = rng.standard_normal(BOOTSTRAP_SAMPLES) if multi is not None else None
+    z = z_t = None
+    if multi is not None:
+        z = rng.standard_normal(BOOTSTRAP_SAMPLES)
+        # The borrowed variance is estimated from max(nb, nn) - 1 degrees of freedom, so the
+        # primary delta (CI, p_not_better) gets a Student-t draw; a normal draw treats it as known
+        # and lets placebos through too often when the global seed effect dominates. Slice, tag
+        # and guardrail SEs keep the normal draw (the SD of a t2 sample is too unstable).
+        df = max(nb, nn) - 1
+        z_t = z / np.sqrt(rng.chisquare(df, BOOTSTRAP_SAMPLES) / df)
     one_seed = np.ones((BOOTSTRAP_SAMPLES, 1))
 
-    def jitter(f, mats=None):
+    def jitter(f, mats=None, draw=None):
         """Seed noise for the one-seed side of quantity f (0 when both sides have seeds)."""
         if z is None:
             return 0.0
@@ -1546,11 +1554,12 @@ def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None, req
         reps = [f(_slice_totals(m, order, w, one_seed)) for m in seeds]
         within = np.mean([np.var(reps[i] - reps[j], ddof=1) / 2
                           for i in range(len(seeds)) for j in range(i + 1, len(seeds))])
-        var = float(np.var(vals, ddof=1)) - float(within)
-        return z * math.sqrt(var) if math.isfinite(var) and var > 0 else 0.0
+        # (1 + 1/n²): resampling the n stored seeds captures only (n-1)/n of their own seed variance.
+        var = (float(np.var(vals, ddof=1)) - float(within)) * (1 + 1 / len(seeds) ** 2)
+        return (z if draw is None else draw) * math.sqrt(var) if math.isfinite(var) and var > 0 else 0.0
 
     primary = lambda t: _primary(t, mode, slice_weights)
-    deltas = primary(new_rep) - primary(base_rep) + jitter(primary)
+    deltas = primary(new_rep) - primary(base_rep) + jitter(primary, draw=z_t)
     paired = lambda f: (float(f(new_pt) - f(base_pt)), float(np.std(f(new_rep) - f(base_rep) + jitter(f), ddof=1)))
     guards = {g: paired(lambda t, num=num, den=den: _guard_value(t, num, den)) for g, (num, den) in GUARDRAILS.items()}
     slices = {s: paired(lambda t, s=s: _scalar_from(t[s], mode)) for s in base_pt}
@@ -1629,7 +1638,8 @@ def _check_pred_schema(pred_rows):
     if cs and not any("id" in c for c in cs) and any("compound_id" in c for c in cs):
         raise ValueError(f"schema mismatch: none of the {len(cs)} predicted compounds has id "
                          "(found 'compound_id': compounds use 'id', measurements use 'compound_id')")
-    if not ms and any(k in d for d in pred_rows for k in ("records", "rgroups", "scaffold")):
+    yaml_keys = ("records", "rgroups", "scaffold")
+    if not ms and any(d.get(k) and "measurements" not in d for d in pred_rows for k in yaml_keys):
         raise ValueError("schema mismatch: records_yaml_v1 keys (records/rgroups/scaffold) but no measurements; "
                          "convert with yaml_to_jsonl.py")
 
