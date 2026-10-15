@@ -170,6 +170,18 @@ class MeasurementTests(unittest.TestCase):
         same_scale_gold = score.normalize_measurement(meas("1", 12.3, unit="nM"))
         self.assertFalse(score._close(same_scale_gold[5:], same_scale_typo[5:]))
 
+    def test_converted_value_must_round_to_gold_as_printed(self):
+        gold = score.normalize_measurement(meas("1", "50", unit="nM"))
+        misread = score.normalize_measurement(meas("1", 7.26, unit="", endpoint="pIC50"))  # = 55 nM
+        faithful = score.normalize_measurement(meas("1", 7.30, unit="", endpoint="pIC50"))  # = 50.1 nM
+        self.assertFalse(score._close(gold[5:], misread[5:]))
+        self.assertTrue(score._close(gold[5:], faithful[5:]))
+        # a coarsely printed prediction does not widen the tolerance
+        coarse = score.normalize_measurement(meas("1", 7, unit="", endpoint="pIC50"))
+        self.assertFalse(score._close(gold[5:], coarse[5:]))
+        # trailing zeros printed in the gold are kept when the value is a string
+        self.assertEqual(score._half_unit("1.80"), 0.005)
+
     def test_ranges(self):
         a = score.normalize_measurement(meas("1", [10, 30], unit="uM"))
         b = score.normalize_measurement(meas("1", [30000, 10000], unit="nM"))
@@ -350,6 +362,16 @@ class StatisticsTests(unittest.TestCase):
 
     def test_rdkit_is_pinned_version(self):
         self.assertEqual(score.RDKIT_VERSION, score.RDKIT_PIN)
+
+    def test_seed_variance_widens_the_interval(self):
+        # same recipe, three seeds that disagree by several points
+        base = [self._per_doc(n, 200, family_size=4) for n in (140, 150, 160)]
+        new = [self._per_doc(n, 200, family_size=4) for n in (146, 154, 162)]
+        pooled = score.paired_compare(score.pool_seeds(base), score.pool_seeds(new))
+        hier = score.paired_compare(base, new)
+        self.assertAlmostEqual(hier["delta"], pooled["delta"])
+        self.assertGreater(hier["ci_hi"] - hier["ci_lo"], pooled["ci_hi"] - pooled["ci_lo"])
+        self.assertEqual(hier["base_seed_scores"], [0.7, 0.75, 0.8])
 
     def test_seed_pooling(self):
         a, b = self._per_doc(60, 100), self._per_doc(80, 100)

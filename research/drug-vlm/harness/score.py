@@ -25,7 +25,8 @@ relative stereo uses CXSMILES enhanced stereo (`|&1:1|`, `|o1:1|`).
 Usage:
     python score.py score   --gold gold.jsonl --pred pred.jsonl [--per-doc-out per_doc.jsonl]
     python score.py compare --base seed0.jsonl,seed1.jsonl --new seed0.jsonl,seed1.jsonl
-    (compare takes per-doc files written by `score`; several seeds per side are pooled)
+    (compare takes per-doc files written by `score`; with several seeds per side, seed-to-seed
+    variance enters the interval through a hierarchical family x seed bootstrap)
 """
 
 import argparse
@@ -34,6 +35,7 @@ import math
 import os
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 
 import numpy as np
@@ -51,7 +53,8 @@ RDKIT_PIN = "2026.09.1"  # canonicalization changes between RDKit releases; scor
 W_STRUCT = 0.5          # weight of structure F1 in the composite score
 W_RECORD = 0.5          # weight of record F1 (structure + value correctly linked)
 VALUE_REL_TOL = 1e-3    # relative tolerance when gold and prediction use the same scale
-LOG_TOL_CONVERTED = 0.05  # log10 tolerance when one side converted pX <-> molar (rounding)
+# When exactly one side was converted (pX or mass -> molar), the prediction must fall inside
+# the rounding interval of the gold value as printed (half a unit in its last digit).
 STRIP_SALTS = True      # compare parent compounds (largest fragment, neutralized)
 MATCH_TARGET = True     # a record must also name the right target
 MAX_HEAVY_ATOMS = 500   # larger predicted structures are invalid (keeps scoring time bounded)
@@ -290,19 +293,28 @@ _RANGE = re.compile(rf"^({_NUM})\s*(?:-|–|—|to)\s*({_NUM})$", re.I)
 _PREFIX = re.compile(r"^(<=|>=|≤|≥|<|>|~|≈|=)\s*")
 
 
+def _half_unit(text):
+    """Half a unit in the last printed digit: '7.26' -> 0.005, '50' -> 0.5, '1.2e-5' -> 5e-7."""
+    try:
+        return 0.5 * 10.0 ** Decimal(text).as_tuple().exponent
+    except (InvalidOperation, TypeError, ValueError):
+        return 0.0
+
+
 def _parse_value(raw, relation):
     """
-    -> (numbers tuple, relation, category). Accepts numbers, [lo, hi], and strings such as
-    '1,200', '>10', '10-30', '10 to 30'. Anything else non-empty ('NT', 'inactive', a
-    binned 'A' or '+++') is a categorical value compared as normalized text.
+    -> (numbers, half_units, relation, category). Accepts numbers, [lo, hi], and strings such
+    as '1,200', '>10', '10-30', '10 to 30'; half_units is the printed precision of each number
+    (store gold values as printed strings to keep trailing zeros). Anything else non-empty
+    ('NT', 'inactive', a binned 'A' or '+++') is a categorical value compared as text.
     """
     if isinstance(raw, bool) or raw is None:
         return None
-    if isinstance(raw, (int, float)):
-        return (float(raw),), relation, None
-    if isinstance(raw, (list, tuple)):
+    items = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    if isinstance(raw, (list, tuple)) or isinstance(raw, (int, float)):
         try:
-            return tuple(float(v) for v in raw), relation, None
+            return (tuple(float(v) for v in items), tuple(_half_unit(repr(v) if isinstance(v, float) else str(v)) for v in items),
+                    relation, None)
         except (TypeError, ValueError):
             return None
     s = str(raw).strip().replace("−", "-").replace(",", "")
@@ -311,18 +323,19 @@ def _parse_value(raw, relation):
         relation, s = (m.group(1) if relation in ("", "=") else relation), s[m.end():]
     r = _RANGE.match(s)
     if r:
-        return (float(r.group(1)), float(r.group(2))), relation, None
+        return (float(r.group(1)), float(r.group(2))), (_half_unit(r.group(1)), _half_unit(r.group(2))), relation, None
     try:
-        return (float(s),), relation, None
+        return (float(s),), (_half_unit(s),), relation, None
     except ValueError:
         token = re.sub(r"[^0-9a-z+\-]+", "", s.casefold())
-        return ((), relation, token) if token else None
+        return ((), (), relation, token) if token else None
 
 
 def normalize_measurement(m, mw=None):
     """
-    -> (endpoint, target, relation, unit_class, condition, values, converted), or None if
-    there is no value. `values` is one number, (lo, hi) for a range, or () for a categorical
+    -> (endpoint, target, relation, unit_class, condition, values, converted, bounds), or None
+    if there is no value. `bounds` is the printed-rounding interval of each value, in the
+    same canonical unit. `values` is one number, (lo, hi) for a range, or () for a categorical
     value (whose text then sits in `relation`), in a canonical unit: molar concentrations in
     nM, times in hours. p-values (pIC50 etc.) are converted to nM with the relation flipped,
     and mass concentrations (µg/mL) to nM using `mw`, the record's structure; `converted`
@@ -333,9 +346,10 @@ def normalize_measurement(m, mw=None):
     parsed = _parse_value(m.get("value"), str(m.get("relation") or "").strip())
     if parsed is None:
         return None
-    values, relation, category = parsed
+    values, halves, relation, category = parsed
     if len(values) > 2 or not all(math.isfinite(v) for v in values):
         return None
+    bounds = tuple((v - h, v + h) for v, h in zip(values, halves))
     endpoint = _norm_endpoint(m.get("endpoint"))
     target = _norm_text(m.get("target")) if MATCH_TARGET else ""
     relation = "range" if len(values) == 2 else _RELATIONS.get(relation, "?")
@@ -345,10 +359,15 @@ def normalize_measurement(m, mw=None):
     elif endpoint in _P_ENDPOINTS and _norm_unit(m.get("unit")) in _PX_UNITS:
         endpoint, unit_class, converted = _P_ENDPOINTS[endpoint], "molar", True
         values, relation = tuple(10.0 ** (9.0 - v) for v in values), _FLIP.get(relation, relation)
+        bounds = tuple((10.0 ** (9.0 - hi), 10.0 ** (9.0 - lo)) for lo, hi in bounds)
     else:
         canon = [_to_canonical(v, m.get("unit"), mw) for v in values]
-        unit_class, values, converted = canon[0][0], tuple(v for _, v, _ in canon), canon[0][2]
-    values = tuple(sorted(values))
+        unit_class, converted = canon[0][0], canon[0][2]
+        scale = [c[1] / v if v else 1.0 for c, v in zip(canon, values)]
+        values = tuple(c[1] for c in canon)
+        bounds = tuple((lo * k, hi * k) for (lo, hi), k in zip(bounds, scale))
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    values, bounds = tuple(values[i] for i in order), tuple(bounds[i] for i in order)
     conc, conc_unit = m.get("conc"), m.get("conc_unit")
     if conc is None:
         at = _AT_CONC.search(str(m.get("endpoint") or ""))
@@ -361,7 +380,7 @@ def normalize_measurement(m, mw=None):
             condition = f"{cls}:{cval:.4g}"
         except (TypeError, ValueError):
             condition = "?"
-    return endpoint, target, relation, unit_class, condition, values, converted
+    return endpoint, target, relation, unit_class, condition, values, converted, bounds
 
 # ---------------------------------------------------------------------------
 # Per-document scoring
@@ -398,7 +417,7 @@ def _multiset_tp(gold_keys, pred_keys):
 
 
 def _records(measurements, table, by_label):
-    """Measurements -> list of (key_tuple, (values, converted)). Unresolvable records keep key None."""
+    """Measurements -> list of (key_tuple, (values, converted, bounds)). Unresolvable records keep key None."""
     out = []
     for m in measurements:
         cid = _norm_label(m.get("compound_id"))
@@ -410,17 +429,17 @@ def _records(measurements, table, by_label):
         if norm is None or ckey is None:
             out.append((None, None))
             continue
-        *fields, values, converted = norm
-        out.append(((ckey, *fields), (values, converted)))
+        *fields, values, converted, bounds = norm
+        out.append(((ckey, *fields), (values, converted, bounds)))
     return out
 
 
 def _close(gold, pred):
-    (gv, gp), (pv, pp) = gold, pred
+    (gv, gc, gb), (pv, pc, _) = gold, pred
     if len(gv) != len(pv):
         return False
-    if gp != pp:   # one side was converted (pX or mass -> molar): allow rounding
-        return all(g > 0 and p > 0 and abs(math.log10(g) - math.log10(p)) <= LOG_TOL_CONVERTED for g, p in zip(gv, pv))
+    if gc != pc:   # one side was converted: the prediction must round to the gold as printed
+        return all(lo * (1 - 1e-9) <= p <= hi * (1 + 1e-9) for (lo, hi), p in zip(gb, pv))
     return all(math.isclose(g, p, rel_tol=VALUE_REL_TOL, abs_tol=1e-12) for g, p in zip(gv, pv))
 
 
@@ -599,27 +618,52 @@ def bootstrap_ci(per_doc, alpha=0.05, scalar="auto"):
     return float(np.quantile(scores, alpha / 2)), float(np.quantile(scores, 1 - alpha / 2))
 
 
+def _as_runs(x):
+    """A per-doc list (one seed) or a list of per-doc lists (several seeds) -> list of runs."""
+    return [x] if x and isinstance(x[0], dict) else list(x)
+
+
 def paired_compare(base, new, alpha=0.10, scalar="auto"):
-    """Paired cluster bootstrap over shared doc_ids: delta = score(new) - score(base)."""
-    b = {d["doc_id"]: d for d in base}
-    n = {d["doc_id"]: d for d in new}
-    ids = sorted(set(b) & set(n))
-    assert ids, "no shared doc_ids between the two runs"
-    base_docs, new_docs = [b[i] for i in ids], [n[i] for i in ids]
-    mode = resolve_scalar(base_docs, scalar)
-    order, base_cols = _cluster_totals(base_docs)
-    _, new_cols = _cluster_totals([dict(d, family_id=b[d["doc_id"]].get("family_id")) for d in new_docs], order)
-    delta = float(aggregate(new_docs, mode)["score"] - aggregate(base_docs, mode)["score"])
-    w = _weights(len(order))
-    deltas = _bootstrap_scores(new_cols, w, mode) - _bootstrap_scores(base_cols, w, mode)
-    return {"delta": delta, "ci_lo": float(np.quantile(deltas, alpha / 2)),
+    """
+    delta = score(new) - score(base), paired on shared doc_ids. `base` and `new` are one run
+    or a list of seed runs each. The bootstrap is hierarchical: every replicate resamples
+    patent families / articles (shared by both sides, which is the pairing) and, separately
+    for each side, its seeds; so seed-to-seed variance is part of the interval. With one
+    seed per side it cannot be, and the result is only a screen.
+    """
+    base_runs, new_runs = _as_runs(base), _as_runs(new)
+    fam = {d["doc_id"]: d.get("family_id") or d["doc_id"] for d in base_runs[0]}
+    ids = set(fam)
+    for run in base_runs + new_runs:
+        ids &= {d["doc_id"] for d in run}
+    ids = sorted(ids)
+    assert ids, "no shared doc_ids between the runs"
+    keep = lambda run: [dict(d, family_id=fam[d["doc_id"]]) for d in run if d["doc_id"] in set(ids)]
+    base_runs, new_runs = [keep(r) for r in base_runs], [keep(r) for r in new_runs]
+    mode = resolve_scalar(base_runs[0], scalar)
+    order, _ = _cluster_totals(base_runs[0])
+    stack = lambda runs: {f: np.stack([_cluster_totals(r, order)[1][f] for r in runs])
+                          for f in _cluster_totals(runs[0], order)[1]}
+    base_m, new_m = stack(base_runs), stack(new_runs)
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    w = rng.multinomial(len(order), np.full(len(order), 1.0 / len(order)), size=BOOTSTRAP_SAMPLES).astype(float)
+
+    def replicates(mats, n_seeds):
+        k = rng.multinomial(n_seeds, np.full(n_seeds, 1.0 / n_seeds), size=BOOTSTRAP_SAMPLES).astype(float)
+        return _scalar_from({f: ((w @ m.T) * k).sum(axis=1) for f, m in mats.items()}, mode)
+
+    point = lambda mats: float(_scalar_from({f: m.sum() for f, m in mats.items()}, mode))
+    deltas = replicates(new_m, len(new_runs)) - replicates(base_m, len(base_runs))
+    seed_scores = lambda runs: [round(aggregate(r, mode)["score"], 6) for r in runs]
+    return {"delta": point(new_m) - point(base_m), "ci_lo": float(np.quantile(deltas, alpha / 2)),
             "ci_hi": float(np.quantile(deltas, 1 - alpha / 2)),
             "p_not_better": float(np.mean(deltas <= 0)), "n_shared": len(ids), "n_clusters": len(order),
-            "scalar": mode}
+            "scalar": mode, "base_seed_scores": seed_scores(base_runs), "new_seed_scores": seed_scores(new_runs)}
 
 
 def pool_seeds(runs):
-    """Several per-doc files of the same recipe (different seeds) -> one per-doc list of summed counts."""
+    """Several per-doc files of the same recipe (different seeds) -> one per-doc list of summed counts.
+    For aggregate reporting only: comparisons should pass the runs separately to paired_compare."""
     pooled = {}
     for run in runs:
         for d in run:
@@ -706,7 +750,7 @@ def main():
                 sl = aggregate([d for d in per_doc if d["slice"] == name], summary["scalar"])
                 print(f"{'slice/' + name + ':':22s}score={sl['score']:.6f} n_docs={sl['n_docs']}")
     else:
-        load = lambda spec: pool_seeds([_read_jsonl(p)[0] for p in spec.split(",")])
+        load = lambda spec: [_read_jsonl(p)[0] for p in spec.split(",")]
         r = paired_compare(load(args.base), load(args.new), scalar=args.scalar)
         print("---")
         print(f"{'delta:':22s}{r['delta']:+.6f}")
@@ -715,6 +759,8 @@ def main():
         print(f"{'n_shared_docs:':22s}{r['n_shared']}")
         print(f"{'n_clusters:':22s}{r['n_clusters']}")
         print(f"{'scalar:':22s}{r['scalar']}")
+        print(f"{'base_seed_scores:':22s}{r['base_seed_scores']}")
+        print(f"{'new_seed_scores:':22s}{r['new_seed_scores']}")
 
 
 if __name__ == "__main__":
