@@ -592,12 +592,14 @@ def aggregate(per_doc, scalar="auto"):
 
 def _cluster_totals(per_doc, cluster_order=None):
     """-> (cluster ids, {field: array of per-cluster totals})."""
-    groups = {}
-    for d in per_doc:
-        groups.setdefault(d.get("family_id") or d["doc_id"], []).append(d)
-    order = cluster_order or sorted(groups)
     fields = [k for k in per_doc[0] if k not in _ID_FIELDS]
-    return order, {f: np.array([sum(d[f] for d in groups.get(c, [])) for c in order], dtype=float) for f in fields}
+    keys = [d.get("family_id") or d["doc_id"] for d in per_doc]
+    order = cluster_order or sorted(set(keys))
+    index = {c: i for i, c in enumerate(order)}
+    totals = np.zeros((len(order), len(fields)))
+    np.add.at(totals, np.array([index[k] for k in keys]),
+              np.array([[d.get(f, 0) for f in fields] for d in per_doc], dtype=float))
+    return order, {f: totals[:, j] for j, f in enumerate(fields)}
 
 
 def _bootstrap_scores(cols, weights, scalar):
@@ -642,8 +644,9 @@ def paired_compare(base, new, alpha=0.10, scalar="auto"):
     base_runs, new_runs = [keep(r) for r in base_runs], [keep(r) for r in new_runs]
     mode = resolve_scalar(base_runs[0], scalar)
     order, _ = _cluster_totals(base_runs[0])
-    stack = lambda runs: {f: np.stack([_cluster_totals(r, order)[1][f] for r in runs])
-                          for f in _cluster_totals(runs[0], order)[1]}
+    def stack(runs):
+        per_run = [_cluster_totals(r, order)[1] for r in runs]
+        return {f: np.stack([t[f] for t in per_run]) for f in per_run[0]}
     base_m, new_m = stack(base_runs), stack(new_runs)
     rng = np.random.default_rng(BOOTSTRAP_SEED)
     w = rng.multinomial(len(order), np.full(len(order), 1.0 / len(order)), size=BOOTSTRAP_SAMPLES).astype(float)
