@@ -61,7 +61,7 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 | 组件 | 作用 | 状态 | 首夜必需 | 验收方式 |
 |---|---|---|---|---|
 | `harness/score.py` + `test_score.py` | 固定评分（相当于 `evaluate_bpb`；说明见 `harness/README.md`） | 已有 v1.8 | 是 | `python3 -m unittest discover -s harness -p "test_*.py"` 全部通过；`score` 输出的 `scorer_version` 行值为 1.8（`grep -E '^scorer_version:[[:space:]]+1\.8$'`） |
-| `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | 是 | `python3 harness/null_sim.py`：层次 bootstrap 的误保留率不高于名义 5%；`python3 harness/null_sim.py 200 screen`：每一行初筛的安慰剂 promising 率 ≤ [25]%（名义约 20%；每行 200 次试验时，校准良好的检验超过 25% 的概率约 3%） |
+| `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | 是 | `python3 harness/null_sim.py`：层次 bootstrap 的误保留率不高于名义 5%；`python3 harness/null_sim.py 400 screen` 与 `400 screen-latent`：每一行初筛的安慰剂 promising 率 ≤ [25]%（名义约 20%；每行 400 次试验时，校准良好的检验超过 25% 的概率 < 1%；v1.8 实测 14–22.5%） |
 | `harness/formats.py` + `abbrev_v1.tsv` + `golden_pairs.tsv` | 各种输出格式 → RDKit 分子；超原子缩写展开 | 待建 | 是 | 疑难分子回归集（约 200 对，覆盖互变异构、盐、E/Z、增强立体、R 基团、同位素、金属）全过；缩写表能复现每一个含超原子的金标 |
 | `harness/dvlm/`（`load_base`、`pools`、`Meter`、`render`、增强算子、`save_adapter`） | 训练侧的唯一入口 | 待建 | 是 | Meter 计数与优化器步数相差 ≤ 2%；`render` 的数据门禁能拦截评测分子 |
 | `harness/dvlm/rewards` | 训练用奖励，复用 score.py 的结构键 | 待建 | 否（RL 通道第 4 周才打开） | 在疑难分子回归集上与 score.py 判定完全一致 |
