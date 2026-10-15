@@ -720,6 +720,9 @@ rgroups:
         for r, expected in (("iBu", "CC(C)CC(=O)O"), ("sBu", "CCC(C)C(=O)O"), ("iPent", "CC(C)CCC(=O)O"),
                             ("tBu", "CC(C)(C)C(=O)O"), ("CH3", "CC(=O)O"), ("N(CH3)2", "CN(C)C(=O)O"),
                             ("4-F-Ph", "O=C(O)c1ccc(F)cc1"), ("3-OMe-phenyl", "COc1cccc(C(=O)O)c1"),
+                            ("4-cPr-Ph", "O=C(O)c1ccc(C2CC2)cc1"), ("3-cPr-Ph", "O=C(O)c1cccc(C2CC2)c1"),
+                            ("4-Ph-Ph", "O=C(O)c1ccc(-c2ccccc2)cc1"), ("4-OPh-Ph", "O=C(O)c1ccc(Oc2ccccc2)cc1"),
+                            ("2-cPr-Ph", "O=C(O)c1ccccc1C1CC1"),
                             ("-OCH3", "COC(=O)O"), ("[*]C#N", "N#CC(=O)O")):
             self.assertEqual(score.structure_key(acid(r)), score.structure_key(expected), r)
 

@@ -73,7 +73,9 @@ _ABBREVIATIONS = {
     "NHCOCH3": "*NC(C)=O", "CH2Ph": "*Cc1ccccc1", "C6H5": "*c1ccccc1",
 }
 _PHENYL = re.compile(r"^([234])-([A-Za-z0-9()]+?)-?(?:Ph|phenyl|C6H4)$")
-_RING_POSITION = {"2": "*c1ccccc1{}", "3": "*c1cccc({})c1", "4": "*c1ccc({})cc1"}
+# Ring-closure label %99 is never used in the table above, so a substituent with its own ring
+# ('4-cPr-Ph', '4-OPh-Ph') cannot close the phenyl ring early into a fused bicycle.
+_RING_POSITION = {"2": "*c%99ccccc%99{}", "3": "*c%99cccc({})c%99", "4": "*c%99ccc({})cc%99"}
 _ROW_META = {"compound_id", "compound", "label", "id", "smiles", "name"}
 
 

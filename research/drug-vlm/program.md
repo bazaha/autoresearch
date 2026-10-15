@@ -67,19 +67,19 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 | `harness/dvlm/rewards` | 训练用奖励，复用 score.py 的结构键 | 待建 | 否（RL 通道第 4 周才打开） | 在疑难分子回归集上与 score.py 判定完全一致 |
 | `harness/prepare.py` | 常量（STAGE、TOKEN_BUDGET、各种上限）；构建数据池、评测层级和 W0 | 待建 | 是 | `./run.sh --check` 的清单与哈希检查通过 |
 | W0-2B 检查点 | 热启动 | 待建 | 是 | DEV 上 ≥ 零样本 + 20 pp |
-| `harness/evalserver.py`（vLLM + LoRA 热切换） | 固定推理，支持第 4 节 `INFER_CONFIG` 的全部字段 | 待建 | 是 | 同一 adapter 评两次，DEV 分数差 ≤ [0.1] pp |
+| `harness/evalserver.py`（vLLM + LoRA 热切换） | 固定推理，支持第 4 节 `INFER_CONFIG` 的全部字段 | 待建 | 是 | 同一 adapter 评两次，DEV 分数差 ≤ [0.1] pp；`INFER_CONFIG` 全字段生效 |
 | `harness/probes.py` + 探针集 | 计算 `probe` 及其配对 bootstrap SE、负对数似然 | 待建 | 是 | 探针集就位；同一 adapter 重算差 ≤ [0.5] pp；输出 SE |
 | 金丝雀集与扰动集（`probes.py` 的另一半） | `canary_gap`、`perturb_gap`（只报警） | 待建 | 否 | 两个集合就位 |
-| `harness/keep_rule.py` + `keep_rule.yaml` | 第 6 节的判定流程；描述符键清单（第 5 节） | 待建 | 是 | 20 个手动安慰剂中被判为 promising 的 ≤ [6] 个（名义率 20%，20 个里超过 4 个的概率约 37%，所以门槛留余量）；阈值冻结 |
+| `harness/keep_rule.py` + `keep_rule.yaml` | 第 6 节的判定流程；描述符键清单（第 5 节） | 待建 | 是 | 20 个手动安慰剂中被判为 promising 的 ≤ [6] 个（名义率 20%，20 个里超过 4 个的概率约 37%，所以门槛留余量）；阈值冻结；描述符键清单与第 5 节一致 |
 | 经验贝叶斯收缩 | 显示和排序用的 Δ | 待建 | 否 | 上线前初筛用原始 Δ |
 | `harness/runner.py` + `run.sh` | 门禁、容器、运行凭证，`results.tsv` 与 `lineage.jsonl` 的唯一写入者 | 待建 | 是 | 20 次试运行的运行凭证全部有效 |
 | Bloom 过滤器、`chattr +i`、签名运行凭证、自动安慰剂注入 | 强制机制的第二层 | 待建 | 否 | 第 3 周补齐；之前校准用的 20 个安慰剂由人手动提交 |
-| 评测层级 `/srv/dvlm/eval/{viz,dev,confirm,reserve,sealed,probe}` | 按文章/专利族划分，InChIKey 第一段跨层去重 | 待建 | 是 | 重叠审计为 0 |
+| 评测层级 `/srv/dvlm/eval/{viz,dev,confirm,reserve,sealed,probe}` | 按文章/专利族划分，InChIKey 第一段跨层去重 | 待建 | 是 | 重叠审计为 0；20% 双人标注 |
 | `/srv/dvlm/policy/current.md` | "当前方针"（可以为空） | 待建 | 是 | 文件存在、root 所有、agent 账户只读 |
 | 隔离：文件权限、分支保护、无网络训练容器 | 最低可用配置的核心（`docs/design.md` 2.2 节） | 待建 | 是 | 以 agent 账户读取 `/srv/dvlm/eval/*/gold` 与 `/srv/dvlm/private/` 失败；agent 账户推进 `autoresearch/<tag>` 被拒；训练容器内联网失败、环境变量里没有 API key；提交 `train.py` 以外的文件返回 `gate_fail` |
 | `train.py` 基线 | W0 + LoRA 的最简单配方（约 400 行） | 待建 | 是 | `./run.sh --smoke` 60 秒内跑通 |
 | `.gitignore` 包含 `notes/`、`requests.md`、`results.tsv`、`lineage.jsonl`、`failed_descriptors.tsv`、`runs/` | 这些文件不进入提交 | 待建 | 是 | `git status` 干净 |
-| 环境：8×H100 节点、支持 `--network none` 的容器运行时、`uv.lock` 锁定 transformers/peft/trl/vllm/`rdkit==2026.09.1`、验证过 Qwen3-VL LoRA 热切换的 vLLM | 可复现的运行环境 | 待建 | 是 | 同一镜像两次构建哈希一致 |
+| 环境：8×H100 节点、支持 `--network none` 的容器运行时、`uv.lock` 锁定 transformers/peft/trl/vllm/`rdkit==2026.09.1`、验证过 Qwen3-VL LoRA 热切换的 vLLM | 可复现的运行环境 | 待建 | 是 | 同一镜像两次构建哈希一致；LoRA 热切换跑通（否则改用合并权重，每次多 3–4 分钟） |
 
 构建顺序、负责人和人日估算见 `docs/design.md` 第 2 节；"首夜必需"一列就是那里的"最低可用配置"。`./run.sh --check` 逐行运行上表的验收项，打印 PASS / FAIL / DEFERRED：首夜必需的项只有 PASS 或 FAIL；可推迟的项在补齐之前显示 DEFERRED。
 
