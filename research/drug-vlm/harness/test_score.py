@@ -48,8 +48,20 @@ class StructureKeyTests(unittest.TestCase):
         self.assertEqual(len(keys), 1)
         self.assertNotEqual(keys.pop(), score.structure_key("[2*]c1ccccc1"))
 
-    def test_atom_maps_on_real_atoms_are_ignored(self):
+    def test_markush_position_variation(self):
+        cl_any = "*Cl.c1ccccc1 |m:0:2.3.4.5.6.7|"
+        self.assertEqual(score.structure_key(cl_any), score.structure_key("c1ccccc1.Cl* |m:7:0.1.2.3.4.5|"))
+        others = ["*Br.c1ccccc1 |m:0:2.3.4.5.6.7|", "c1ccccc1", "Clc1ccccc1"]
+        self.assertEqual(len({score.structure_key(s) for s in [cl_any] + others}), 4)
+        # pyridine: Cl at para/meta (either side, symmetric) vs meta/ortho
+        para_meta = score.structure_key("*Cl.c1ccncc1 |m:0:2.3|")
+        self.assertEqual(para_meta, score.structure_key("*Cl.c1ccncc1 |m:0:2.7|"))
+        self.assertNotEqual(para_meta, score.structure_key("*Cl.c1ccncc1 |m:0:3.4|"))
+        self.assertFalse(score.is_multifragment(cl_any))
+
+    def test_atom_maps_and_labels_on_real_atoms_are_ignored(self):
         self.assertEqual(score.structure_key("[CH3:1][C:2](=O)O"), score.structure_key("CC(=O)O"))
+        self.assertEqual(score.structure_key("[1*]c1ccc(C)cc1 |$;;;;Me;;;$|"), score.structure_key("[1*]c1ccc(C)cc1"))
 
     def test_enhanced_stereo(self):
         rac_a, rac_b = "C[C@H](N)C(=O)O |&1:1|", "C[C@@H](N)C(=O)O |&1:1|"

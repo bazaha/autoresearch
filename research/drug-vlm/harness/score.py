@@ -87,9 +87,16 @@ def _rlabel_number(atom):
     return _GENERIC_LABELS.get(label.lstrip("_"), 0 if label in ("*", "R", "_R") else 99)
 
 
+def _is_markush(mol):
+    return any(atom.GetAtomicNum() == 0 for atom in mol.GetAtoms())
+
+
 @lru_cache(maxsize=200_000)
 def _standardize(smiles):
-    """SMILES/CXSMILES -> standardized RDKit mol, or None if unparseable."""
+    """
+    SMILES/CXSMILES -> standardized RDKit mol, or None if unparseable. Markush structures
+    are not fragment-stripped: their floating substituents (CXSMILES m:) are fragments.
+    """
     if not isinstance(smiles, str) or not smiles.strip():
         return None
     mol = Chem.MolFromSmiles(smiles.strip())
@@ -99,13 +106,14 @@ def _standardize(smiles):
         mol = Chem.RWMol(mol)
         for atom in mol.GetAtoms():
             if atom.GetAtomicNum() == 0:   # one spelling for every R-label convention
-                n = _rlabel_number(atom)
-                for prop in _DUMMY_PROPS:
-                    if atom.HasProp(prop):
-                        atom.ClearProp(prop)
-                atom.SetIsotope(n)
+                atom.SetIsotope(_rlabel_number(atom))
+            for prop in _DUMMY_PROPS:      # labels on real atoms are display aliases only
+                if atom.HasProp(prop):
+                    atom.ClearProp(prop)
             atom.SetAtomMapNum(0)
         mol = mol.GetMol()
+        if _is_markush(mol):
+            return mol if mol.GetNumHeavyAtoms() <= MAX_HEAVY_ATOMS else None
         if STRIP_SALTS:
             mol = rdMolStandardize.FragmentParent(mol)
             mol = _uncharger.uncharge(mol)
@@ -120,6 +128,39 @@ def _standardize(smiles):
     return mol
 
 
+def _markush_smiles(mol, isomeric=True):
+    """
+    Canonical text for a Markush structure. Position-variation groups (CXSMILES m:, kept by
+    RDKit only as bond properties and dropped on output) are encoded explicitly: each
+    floating substituent becomes a canonical fragment SMILES, and the core atoms it may
+    attach to are tagged with atom-map labels before the core is canonicalized.
+    """
+    mol = Chem.Mol(mol)
+    if not isomeric:
+        Chem.RemoveStereochemistry(mol)
+    floating = [b for b in mol.GetBonds() if b.HasProp("_MolFileBondEndPts")]
+    if not floating:
+        return Chem.MolToCXSmiles(mol)
+    frag_of = {a: frag for frag in Chem.GetMolFrags(mol) for a in frag}
+    groups = []
+    for bond in floating:
+        frag = frag_of[bond.GetBeginAtomIdx()]
+        ends = [int(x) - 1 for x in bond.GetProp("_MolFileBondEndPts").strip("()").split()[1:]]
+        groups.append((Chem.MolFragmentToSmiles(mol, atomsToUse=list(frag)), frag, ends))
+    labels = {smi: i + 1 for i, smi in enumerate(sorted({smi for smi, _, _ in groups}))}
+    core = Chem.RWMol(mol)
+    tags = {}
+    for smi, _, ends in groups:
+        for a in ends:
+            tags.setdefault(a, set()).add(labels[smi])
+    for a, ls in tags.items():
+        core.GetAtomWithIdx(a).SetAtomMapNum(int("".join(str(l) for l in sorted(ls))))
+    for a in sorted({a for _, frag, _ in groups for a in frag}, reverse=True):
+        core.RemoveAtom(a)
+    subs = sorted(smi for smi, _, _ in groups)
+    return Chem.MolToCXSmiles(core) + " m:" + ".".join(subs)
+
+
 @lru_cache(maxsize=200_000)
 def structure_keys(smiles):
     """
@@ -132,10 +173,8 @@ def structure_keys(smiles):
     mol = _standardize(smiles)
     if mol is None:
         return None, None
-    if any(atom.GetAtomicNum() == 0 for atom in mol.GetAtoms()):
-        flat = Chem.Mol(mol)
-        Chem.RemoveStereochemistry(flat)
-        return "MARKUSH:" + Chem.MolToCXSmiles(mol), "MARKUSH:" + Chem.MolToSmiles(flat)
+    if _is_markush(mol):
+        return "MARKUSH:" + _markush_smiles(mol), "MARKUSH:" + _markush_smiles(mol, isomeric=False)
     inchikey = Chem.MolToInchiKey(mol)
     if not inchikey:
         flat = Chem.Mol(mol)
@@ -152,9 +191,9 @@ def structure_key(smiles):
 
 @lru_cache(maxsize=200_000)
 def is_multifragment(smiles):
-    """True if a structure still has several fragments after removing known salts/solvents."""
+    """True if a non-Markush structure still has several fragments after removing salts/solvents."""
     mol = Chem.MolFromSmiles(smiles.strip()) if isinstance(smiles, str) and smiles.strip() else None
-    if mol is None:
+    if mol is None or _is_markush(mol):
         return False
     return len(Chem.GetMolFrags(_salt_remover.remove(mol))) > 1
 
