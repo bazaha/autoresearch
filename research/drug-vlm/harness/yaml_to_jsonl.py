@@ -12,20 +12,23 @@ that score.py reads, one line per doc_id. One YAML document per table; a file ma
 
 R positions in the scaffold are [*:n], [n*] or CXSMILES labels ($_R1$, $X$); a row key R1 or X
 names the position (a bare * is R). An R group is a SMILES fragment with its attachment point
-([*], [*:1]), a fragment without one (attached at its first atom: "F", "OC", "c1ccccc1"), H, or
-an abbreviation ("OMe", "CF3", "iPr", "CO2Et", RDKit's default list plus a few more). A row
-whose fragment cannot be read gets no structure (reported on stderr): its records still count
-in record_f1_by_label and are unlinked in record_f1.
+([*], [*:1]), a fragment without one (attached at its first atom: "F", "OC", "c1ccccc1"), H, an
+abbreviation or condensed formula from the fixed table below ("OMe", "iPr", "CH3", "N(CH3)2"),
+or a substituted phenyl ("4-F-Ph", "3-OMe-phenyl"). A row whose fragment cannot be read gets no
+structure (reported on stderr): its records still count in record_f1_by_label and are unlinked
+in record_f1.
 
 All YAML scalars are read as strings, so values keep their printed form ("12.30" stays "12.30").
 The older key `compound` is accepted for `compound_id` (with a warning). A value that is a
 legend key gets the legend text in `bin` (ignored by the scorer, kept for the deliverable).
+A file that is not valid YAML is skipped with a warning (its documents score as missing).
 
 Usage: python yaml_to_jsonl.py tables/*.yaml > pred.jsonl
 """
 
 import json
 import os
+import re
 import sys
 
 try:
@@ -33,7 +36,6 @@ try:
 except ImportError:
     sys.exit("yaml_to_jsonl.py needs PyYAML (pip install pyyaml)")
 from rdkit import Chem, RDLogger
-from rdkit.Chem import rdAbbreviations
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from score import _norm_label
@@ -41,15 +43,37 @@ from score import _norm_label
 RDLogger.DisableLog("rdApp.*")
 
 _NULL = {"", "null", "~", "none", "None", "NULL", "Null"}
-_ABBREVIATIONS = {a.label: Chem.MolToSmiles(a.mol) for a in rdAbbreviations.GetDefaultAbbreviations()}
-_ABBREVIATIONS.update({
-    "Me": "*C", "Pr": "*CCC", "Bu": "*CCCC", "cPr": "*C1CC1", "cBu": "*C1CCC1", "cPent": "*C1CCCC1",
-    "cHex": "*C1CCCCC1", "Ph": "*c1ccccc1", "Bn": "*Cc1ccccc1", "OPh": "*Oc1ccccc1", "OBn": "*OCc1ccccc1",
-    "OH": "*O", "SH": "*S", "NH2": "*N", "NHMe": "*NC", "NMe2": "*N(C)C", "OCF3": "*OC(F)(F)F",
-    "OCHF2": "*OC(F)F", "CHF2": "*C(F)F", "CH2F": "*CF", "CONH2": "*C(N)=O", "CONHMe": "*C(=O)NC",
-    "SO2Me": "*S(C)(=O)=O", "SO2NH2": "*S(N)(=O)=O", "CO2Me": "*C(=O)OC", "COOMe": "*C(=O)OC",
-    "Boc": "*C(=O)OC(C)(C)C", "Cbz": "*C(=O)OCc1ccccc1", "Ms": "*S(C)(=O)=O", "Ts": "*S(=O)(=O)c1ccc(C)cc1",
-})
+# Written out by hand rather than taken from rdAbbreviations.GetDefaultAbbreviations(): RDKit's
+# list maps iBu and iPent to the sec-isomers, and a pinned table cannot change meaning between
+# RDKit releases. '*' is the attachment point.
+_ABBREVIATIONS = {
+    # alkyl
+    "Me": "*C", "Et": "*CC", "Pr": "*CCC", "nPr": "*CCC", "iPr": "*C(C)C", "Bu": "*CCCC", "nBu": "*CCCC",
+    "iBu": "*CC(C)C", "sBu": "*C(C)CC", "tBu": "*C(C)(C)C", "nPent": "*CCCCC", "iPent": "*CCC(C)C",
+    "nHex": "*CCCCCC", "cPr": "*C1CC1", "c-Pr": "*C1CC1", "cBu": "*C1CCC1", "cPent": "*C1CCCC1",
+    "cHex": "*C1CCCCC1", "Cy": "*C1CCCCC1",
+    # aryl, benzyl, acyl
+    "Ph": "*c1ccccc1", "Bn": "*Cc1ccccc1", "Bz": "*C(=O)c1ccccc1", "Ac": "*C(C)=O", "CHO": "*C=O",
+    # O / S / N substituents
+    "OH": "*O", "OMe": "*OC", "OEt": "*OCC", "OiPr": "*OC(C)C", "OiBu": "*OCC(C)C", "OtBu": "*OC(C)(C)C",
+    "OPh": "*Oc1ccccc1", "OBn": "*OCc1ccccc1", "OAc": "*OC(C)=O", "OCF3": "*OC(F)(F)F", "OCHF2": "*OC(F)F",
+    "SH": "*S", "SMe": "*SC", "NH2": "*N", "NHMe": "*NC", "NMe": "*NC", "NHEt": "*NCC", "NMe2": "*N(C)C",
+    "NEt2": "*N(CC)CC", "NHAc": "*NC(C)=O", "NO2": "*[N+](=O)[O-]", "NO": "*N=O", "CN": "*C#N",
+    "NCF3": "*NC(F)(F)F", "N(OH)CH3": "*N(C)O",
+    # halo-alkyl, carbonyl and sulfonyl groups
+    "CF3": "*C(F)(F)F", "CHF2": "*C(F)F", "CH2F": "*CF", "CCl3": "*C(Cl)(Cl)Cl",
+    "CO2H": "*C(=O)O", "COOH": "*C(=O)O", "CO2Me": "*C(=O)OC", "COOMe": "*C(=O)OC", "CO2Et": "*C(=O)OCC",
+    "COOEt": "*C(=O)OCC", "CONH2": "*C(N)=O", "CONHMe": "*C(=O)NC", "SO2Me": "*S(C)(=O)=O", "Ms": "*S(C)(=O)=O",
+    "SO2NH2": "*S(N)(=O)=O", "SO3H": "*S(=O)(=O)O", "Ts": "*S(=O)(=O)c1ccc(C)cc1",
+    "Boc": "*C(=O)OC(C)(C)C", "Cbz": "*C(=O)OCc1ccccc1",
+    # condensed formulas, common in CN/JP patent tables
+    "CH3": "*C", "C2H5": "*CC", "CH2CH3": "*CC", "OCH3": "*OC", "OC2H5": "*OCC", "OCH2CH3": "*OCC",
+    "SCH3": "*SC", "NHCH3": "*NC", "N(CH3)2": "*N(C)C", "CH2OH": "*CO", "CH2NH2": "*CN", "COCH3": "*C(C)=O",
+    "CO2CH3": "*C(=O)OC", "COOCH3": "*C(=O)OC", "CO2C2H5": "*C(=O)OCC", "SO2CH3": "*S(C)(=O)=O",
+    "NHCOCH3": "*NC(C)=O", "CH2Ph": "*Cc1ccccc1", "C6H5": "*c1ccccc1",
+}
+_PHENYL = re.compile(r"^([234])-([A-Za-z0-9()]+?)-?(?:Ph|phenyl|C6H4)$")
+_RING_POSITION = {"2": "*c1ccccc1{}", "3": "*c1cccc({})c1", "4": "*c1ccc({})cc1"}
 _ROW_META = {"compound_id", "compound", "label", "id", "smiles", "name"}
 
 
@@ -57,8 +81,13 @@ def _null(x):
     return x is None or (isinstance(x, str) and x.strip() in _NULL)
 
 
+def _canon(smiles):
+    mol = Chem.MolFromSmiles(smiles) if smiles else None
+    return Chem.MolToSmiles(mol) if mol is not None else smiles
+
+
 def _position_name(atom):
-    """Row key that names this scaffold dummy: R<n> for [*:n], [n*], $_Rn$; the label for $X$."""
+    """Row key that names this scaffold dummy: R<n> for [*:n], [n*], $_Rn$; the label for $X$; R for *."""
     n = atom.GetAtomMapNum() or atom.GetIsotope()
     if n:
         return f"R{n}"
@@ -67,15 +96,29 @@ def _position_name(atom):
     label = label.lstrip("_")
     if label.isdigit():
         return f"R{label}"
-    return label or "R"
+    return "R" if label in ("", "*") else label
+
+
+def _abbreviation(text):
+    """Abbreviation, condensed formula or 'n-X-Ph' -> SMILES with '*', or None."""
+    t = text
+    if t in _ABBREVIATIONS:
+        return _ABBREVIATIONS[t]
+    m = _PHENYL.match(t)
+    if m:
+        sub = _ABBREVIATIONS.get(m.group(2))
+        sub = sub[1:] if sub else (m.group(2) if m.group(2) in ("F", "Cl", "Br", "I") else None)
+        if sub:
+            return _RING_POSITION[m.group(1)].format(sub)
+    return None
 
 
 def _fragment(text, n):
     """R-group text -> mol with exactly one dummy atom, mapped to n; None if unreadable."""
-    t = str(text).strip()
-    if t in ("H", "[H]", "-H"):
+    t = str(text).strip().lstrip("-–")   # '-F', '–OMe': the bond to the scaffold, not part of the group
+    if t in ("H", "[H]"):
         t = "[H][*]"
-    t = _ABBREVIATIONS.get(t.lstrip("-"), t)
+    t = _abbreviation(t) or t
     mol = Chem.MolFromSmiles(t)
     if mol is None:
         return None
@@ -100,7 +143,6 @@ def _fragment(text, n):
 def enumerate_rows(scaffold_smiles, rows):
     """-> [(compound_id, smiles or None, problem or None)] for each R-group row."""
     scaffold = Chem.MolFromSmiles(scaffold_smiles) if not _null(scaffold_smiles) else None
-    out = []
     if scaffold is None:
         return [(_row_id(r), None, "scaffold missing or unreadable") for r in rows]
     positions = {}
@@ -110,8 +152,7 @@ def enumerate_rows(scaffold_smiles, rows):
             positions.setdefault(_position_name(atom), []).append(atom.GetIdx())
     # Every dummy gets its own map number; a label drawn twice (two R1) gets the same
     # substituent at both places.
-    numbered = {}
-    next_map = 1
+    numbered, next_map = {}, 1
     for name, idxs in sorted(positions.items()):
         numbered[name] = []
         for idx in idxs:
@@ -121,6 +162,7 @@ def enumerate_rows(scaffold_smiles, rows):
             numbered[name].append(next_map)
             next_map += 1
     base = rw.GetMol()
+    out = []
     for row in rows:
         cid = _row_id(row)
         if not _null(row.get("smiles")):
@@ -160,6 +202,20 @@ def _row_id(row):
     return None
 
 
+def _rows(table, key, where, warn):
+    """table[key] as a list of mappings; anything else is reported, not silently dropped."""
+    rows = table.get(key)
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        warn(f"{where}: '{key}' is not a list, skipped")
+        return []
+    good = [r for r in rows if isinstance(r, dict)]
+    if len(good) < len(rows):
+        warn(f"{where}: {len(rows) - len(good)} entries of '{key}' are not mappings, skipped")
+    return good
+
+
 def convert(tables, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
     """Parsed records_yaml_v1 tables -> list of scorer documents (dicts), in first-seen doc order."""
     docs, renamed = {}, 0
@@ -174,37 +230,42 @@ def convert(tables, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
             continue
         where = f"{doc_id} {head.get('table_id') or ''}".strip()
         doc = docs.setdefault(doc_id, {"doc_id": doc_id, "compounds": [], "measurements": []})
-        seen = {_norm_label(c["id"]): c["smiles"] for c in doc["compounds"]}
+        index = {_norm_label(c["id"]): c for c in doc["compounds"]}
 
         def add(cid, smiles):
             key = _norm_label(cid)
             if not key:
+                warn(f"{where}: a compound without a usable compound_id ({cid!r}) was dropped")
                 return
-            if key in seen:
-                if smiles and seen[key] and Chem.CanonSmiles(smiles) != Chem.CanonSmiles(seen[key]):
+            if key in index:
+                old = index[key]
+                if old["smiles"] is None and smiles:
+                    old["smiles"] = smiles   # a later table could read what an earlier one could not
+                elif smiles and old["smiles"] and _canon(smiles) != _canon(old["smiles"]):
                     warn(f"{where}: compound {cid} has two different structures; the first is kept")
                 return
-            seen[key] = smiles
-            doc["compounds"].append({"id": cid, "smiles": smiles})
+            index[key] = {"id": cid, "smiles": smiles}
+            doc["compounds"].append(index[key])
 
         scaffold = table.get("scaffold") if isinstance(table.get("scaffold"), dict) else {}
-        rows = [r for r in (table.get("rgroups") or []) if isinstance(r, dict)]
+        scaffold_smiles = next((scaffold[k] for k in ("cxsmiles", "smiles") if not _null(scaffold.get(k))), None)
+        rows = _rows(table, "rgroups", where, warn)
         if rows:
-            for cid, smiles, problem in enumerate_rows(scaffold.get("cxsmiles") or scaffold.get("smiles"), rows):
+            for cid, smiles, problem in enumerate_rows(scaffold_smiles, rows):
                 if problem:
                     warn(f"{where}: compound {cid}: {problem}")
                 add(cid, smiles)
-        for c in table.get("compounds") or []:
-            if isinstance(c, dict):
-                add(_row_id(c), None if _null(c.get("smiles")) else str(c["smiles"]))
+        for c in _rows(table, "compounds", where, warn):
+            add(_row_id(c), None if _null(c.get("smiles")) else str(c["smiles"]))
         legend = table.get("legend") if isinstance(table.get("legend"), dict) else {}
-        for r in table.get("records") or []:
-            if not isinstance(r, dict):
-                continue
+        for r in _rows(table, "records", where, warn):
             m = {k: v for k, v in r.items() if k != "footnote" and not _null(v)}
             if "compound_id" not in m and "compound" in m:
                 m["compound_id"] = m.pop("compound")
                 renamed += 1
+            m.pop("compound", None)
+            if "compound_id" not in m:
+                m["compound_id"] = None   # no label printed: the record scores as unlinked
             value = str(m.get("value", "")).strip().rstrip("*")
             if value in legend:
                 m["bin"] = legend[value]
@@ -214,11 +275,20 @@ def convert(tables, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
     return list(docs.values())
 
 
-def main(paths):
+def load(paths, warn=lambda msg: print("warning: " + msg, file=sys.stderr)):
+    """YAML files -> list of tables; a file that is not valid YAML is skipped with a warning."""
     tables = []
     for path in paths:
-        with open(path, encoding="utf-8") as f:
-            tables.extend(yaml.load_all(f, Loader=yaml.BaseLoader))
+        try:
+            with open(path, encoding="utf-8") as f:
+                tables.extend(list(yaml.load_all(f, Loader=yaml.BaseLoader)))
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            warn(f"{path}: not valid YAML, skipped ({getattr(e, 'problem', None) or e})")
+    return tables
+
+
+def main(paths):
+    tables = load(paths)
     docs = convert(tables)
     n_c = sum(len(d["compounds"]) for d in docs)
     n_s = sum(1 for d in docs for c in d["compounds"] if c["smiles"])

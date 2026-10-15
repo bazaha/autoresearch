@@ -60,9 +60,9 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 
 | 组件 | 作用 | 状态 | 首夜必需 | 验收方式 |
 |---|---|---|---|---|
-| `harness/score.py` + `test_score.py` | 固定评分（相当于 `evaluate_bpb`；说明见 `harness/README.md`） | 已有 v1.8 | 是 | `python3 -m unittest discover -s harness -p "test_*.py"` 全部通过；`score` 输出 `scorer_version: 1.8` |
-| `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | 是 | `python3 harness/null_sim.py`：层次 bootstrap 的误保留率不高于名义 5%；`python3 harness/null_sim.py 200 screen`：初筛的安慰剂 promising 率 ≤ [20]%（名义约 20%） |
-| `harness/formats.py` + `abbrev_v1.tsv` + `golden_pairs.tsv` | 各种输出格式 → RDKit 分子；超原子缩写展开 | 待建 | 是 | 约 200 对疑难分子回归集（互变异构、盐、E/Z、增强立体、R 基团、同位素、金属）全过；缩写表能复现每一个含超原子的金标 |
+| `harness/score.py` + `test_score.py` | 固定评分（相当于 `evaluate_bpb`；说明见 `harness/README.md`） | 已有 v1.8 | 是 | `python3 -m unittest discover -s harness -p "test_*.py"` 全部通过；`score` 输出的 `scorer_version` 行值为 1.8（`grep -E '^scorer_version:[[:space:]]+1\.8$'`） |
+| `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | 是 | `python3 harness/null_sim.py`：层次 bootstrap 的误保留率不高于名义 5%；`python3 harness/null_sim.py 200 screen`：每一行初筛的安慰剂 promising 率 ≤ [25]%（名义约 20%；每行 200 次试验时，校准良好的检验超过 25% 的概率约 3%） |
+| `harness/formats.py` + `abbrev_v1.tsv` + `golden_pairs.tsv` | 各种输出格式 → RDKit 分子；超原子缩写展开 | 待建 | 是 | 疑难分子回归集（约 200 对，覆盖互变异构、盐、E/Z、增强立体、R 基团、同位素、金属）全过；缩写表能复现每一个含超原子的金标 |
 | `harness/dvlm/`（`load_base`、`pools`、`Meter`、`render`、增强算子、`save_adapter`） | 训练侧的唯一入口 | 待建 | 是 | Meter 计数与优化器步数相差 ≤ 2%；`render` 的数据门禁能拦截评测分子 |
 | `harness/dvlm/rewards` | 训练用奖励，复用 score.py 的结构键 | 待建 | 否（RL 通道第 4 周才打开） | 在疑难分子回归集上与 score.py 判定完全一致 |
 | `harness/prepare.py` | 常量（STAGE、TOKEN_BUDGET、各种上限）；构建数据池、评测层级和 W0 | 待建 | 是 | `./run.sh --check` 的清单与哈希检查通过 |
@@ -76,6 +76,7 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 | Bloom 过滤器、`chattr +i`、签名运行凭证、自动安慰剂注入 | 强制机制的第二层 | 待建 | 否 | 第 3 周补齐；之前校准用的 20 个安慰剂由人手动提交 |
 | 评测层级 `/srv/dvlm/eval/{viz,dev,confirm,reserve,sealed,probe}` | 按文章/专利族划分，InChIKey 第一段跨层去重 | 待建 | 是 | 重叠审计为 0 |
 | `/srv/dvlm/policy/current.md` | "当前方针"（可以为空） | 待建 | 是 | 文件存在、root 所有、agent 账户只读 |
+| 隔离：文件权限、分支保护、无网络训练容器 | 最低可用配置的核心（`docs/design.md` 2.2 节） | 待建 | 是 | 以 agent 账户读取 `/srv/dvlm/eval/*/gold` 与 `/srv/dvlm/private/` 失败；agent 账户推进 `autoresearch/<tag>` 被拒；训练容器内联网失败、环境变量里没有 API key；提交 `train.py` 以外的文件返回 `gate_fail` |
 | `train.py` 基线 | W0 + LoRA 的最简单配方（约 400 行） | 待建 | 是 | `./run.sh --smoke` 60 秒内跑通 |
 | `.gitignore` 包含 `notes/`、`requests.md`、`results.tsv`、`lineage.jsonl`、`failed_descriptors.tsv`、`runs/` | 这些文件不进入提交 | 待建 | 是 | `git status` 干净 |
 | 环境：8×H100 节点、支持 `--network none` 的容器运行时、`uv.lock` 锁定 transformers/peft/trl/vllm/`rdkit==2026.09.1`、验证过 Qwen3-VL LoRA 热切换的 vLLM | 可复现的运行环境 | 待建 | 是 | 同一镜像两次构建哈希一致 |
@@ -94,7 +95,7 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
    - `harness/dvlm/` 各函数的 docstring（接口草案见 `docs/design.md` 2.3 节）：数据、预算、渲染、奖励和保存都只能通过它；
    - `harness/score.py`：只为理解指标而读；
    - `results.tsv`、`lineage.jsonl`、`failed_descriptors.tsv`（如果已有）：以前试过什么、为什么失败。
-3. **确认环境就绪**：`./run.sh --check`。任何一项不通过，告诉人类，不要自己修。
+3. **确认环境就绪**：`./run.sh --check`。打印了任何 FAIL 就告诉人类，不要自己修；DEFERRED（可推迟到第 3–4 周的项）不阻止开跑。
 4. **基线**：`./run.sh --baseline`。runner 用 3 个种子跑**未修改的 `train.py`**，作为第一个在位者。等它结束。
 5. **向人类确认后开始循环。**
 
@@ -157,27 +158,27 @@ Expect: +0.8 pp 总体；chiral 标签 +2 pp
 
   | 想法（第 9 节） | 键（**H** = 长程敏感，runner 自动标记） |
   |---|---|
-  | 1 学习率与调度 | `lr_llm`、`lr_vit`、`lr_merger`（H）；`sched`（H）；`warmup`（H） |
+  | 1 学习率与调度 | `lr_llm`（H）、`lr_vit`（H）、`lr_merger`（H）、`sched`（H）、`warmup`（H） |
   | 2 数据池权重与筛选 | `real_frac`；`pool_<池名>`（如 `pool_uspto=0.5`）；`filter_<字段>` |
   | 3 增强与课程 | `aug_strength`、`aug_curriculum`、`render_style` |
   | 4 标签视图 | `label_view` |
   | 5 手性 | `stereo_oversample`、`wedge_swap`、`decoy_wedge` |
   | 6 LoRA | `lora_targets`、`lora_r` |
-  | 7 分辨率 | `max_pixels`（H）、`pad_square` |
+  | 7 分辨率 | `max_pixels`（H）、`pad_to_square` |
   | 8 平均 | `ema`、`ckpt_avg` |
   | 9 难例 | `hard_weight` |
   | 10 回放 | `replay_frac` |
   | 11 输出格式 | `output_format` |
-  | 12 推理链 | `cot` |
+  | 12 推理链 | 用 `output_format` 表示（如 `output_format=cot+smiles`），不另设键 |
   | 13 批大小 | `batch` |
-  | 14 语法约束 | `grammar` |
-  | 15 投票 | `vote_k` |
+  | 14 语法约束 | `grammar_id` |
+  | 15 投票 | `vote_k`、`vote_temp` |
   | 16 切块 | `tiling`（H） |
   | 17 随机化 SMILES | `rand_smiles` |
   | 18–19 RL 通道 | `rl_mrt`、`rl_grpo` |
   | 20–21 视觉侧与全参 | `vit_unfreeze`（H）、`full_ft`（H） |
   | 22 损失细节 | `loss_mask`、`label_smooth` |
-  | 提示词 | `prompt` |
+  | 提示词、解码长度 | `prompt`、`max_new_tokens` |
 - `Expect:`（必填）：预期增量。事后对照预期和结果，是你校准直觉的方式。
 - `Differs-From: <commit>` + `Changed: ……`：只在描述符与 `failed_descriptors.tsv` 中已失败的条目重复时需要，写明这次哪里不同；缺了 → `gate_fail`。
 - `Fix-Of: <commit>`：修复同一想法的崩溃时使用（最多 2 次），不算重复描述符。
@@ -229,7 +230,7 @@ incumbent:            7c1e2a9（autoresearch/oct29-s1 已前移）
 
 1. **门禁**：提交只改了 `train.py`、通过静态扫描和 Bloom 过滤器、描述符是新的（或写了 `Differs-From`/`Changed`）；否则 `gate_fail`。
 2. **冒烟**（需要时）：崩溃 → 返回日志尾部，你可以用 `Fix-Of:` 修最多 2 次，之后 `crash`。
-3. **初筛 screen**：用种子 s0 训练（与在位者的 s0 共享），和在位者已存的 3 个种子做配对比较（`score.py compare`，族 × 种子层次 bootstrap；新候选只有 1 个种子，它缺少的种子方差从在位者 3 个种子的差异借来）。运行凭证无效 → `receipt_invalid`。
+3. **初筛 screen**：用种子 s0 训练（与在位者的 s0 共享），和在位者已存的 3 个种子做配对比较（`score.py compare`，族 × 种子层次 bootstrap；新候选只有 1 个种子，它缺少的全局种子方差从在位者 3 个种子的差异借来）。运行凭证无效 → `receipt_invalid`。
 4. **否决**（每一步都检查；SE：`invalid`、`multifrag` 和各分组来自 `compare` 的配对 bootstrap，`probe` 来自 `probes.py` 的配对 bootstrap）→ `veto:<护栏名>`。注意方向：
 
    | 护栏 | 方向 | 否决条件 |
@@ -354,8 +355,8 @@ runner 在连续 [2] 个夜晚或 [150] 个候选没有产生 `established` 时�
 | 17 | 随机化 SMILES 作为训练目标 | ±1 | — |
 | 18 | RL 通道：MRT，奖励 = 0.1·valid + 0.5·sim·valid + 0.4·exact（与 COMO 相同；exact 用 score.py 的结构键，由 `dvlm.rewards` 提供） | +1–5 | COMO（EditDistance 版）对比 MolScribe 的精确匹配：JPO +12.9、ACS +16.3 |
 | 19 | RL 通道：GRPO/DAPO，按 score.py 结构键的二值奖励 + 编造立体的惩罚 | 0 至 +3 | ChemVLR 的奖励是 Tanimoto=1，不区分立体异构；MolSeek-OCR 的 GSPO 降低了精确匹配 |
-| 20 | 顶部几层 ViT，0.1× 学习率（慢路径） | 低 | — |
-| 21 | 选择性全参阶段（慢路径） | 不稳定 | MolSeek-OCR：直接全参发散 |
+| 20 | 顶部几层 ViT，0.1× 学习率（慢路径） | 低，H | — |
+| 21 | 选择性全参阶段（慢路径） | 不稳定，H | MolSeek-OCR：直接全参发散 |
 | 22 | 只对答案计损失；标签平滑 | ≈ 0 | — |
 
 **已知的负面结果（不要重复踩坑）：**

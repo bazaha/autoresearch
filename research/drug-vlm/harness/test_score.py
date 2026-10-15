@@ -672,6 +672,8 @@ class LabelListTests(unittest.TestCase):
         for raw in ("1;2", "12a；12b", "化合物1、2"):
             self.assertEqual(score._norm_label(raw), "", raw)
         self.assertEqual(score._norm_label("Example 1-2"), "1-2")
+        for raw, label in (("cpd 3;", "3"), ("12a；", "12a"), ("化合物5、", "5")):   # a stray trailing separator
+            self.assertEqual(score._norm_label(raw), label, raw)
         gold = doc([{"id": "1-2", "smiles": ASPIRIN}], [meas("1-2", 12.3)])
         pred = doc([{"id": "1-2", "smiles": ASPIRIN}], [meas("1;2", 12.3)])
         self.assertEqual(score.score_document(gold, pred)["record_tp"], 0)
@@ -697,6 +699,76 @@ rgroups:
   - {compound_id: "20", R1: "CF3", X: "Cl"}
   - {compound_id: "21", R1: "Xyz", X: "Cl"}
 """
+
+    def _convert(self, text):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        import yaml_to_jsonl
+        warnings = []
+        docs = yaml_to_jsonl.convert(list(yaml.load_all(text, Loader=yaml.BaseLoader)), warn=warnings.append)
+        return docs, warnings
+
+    def test_abbreviations_are_pinned_and_attach_once(self):
+        import yaml_to_jsonl
+        from rdkit import Chem
+        for label, smi in yaml_to_jsonl._ABBREVIATIONS.items():
+            self.assertIsNotNone(Chem.MolFromSmiles(smi), label)
+            self.assertEqual(smi.count("*"), 1, label)
+        acid = lambda r: yaml_to_jsonl.enumerate_rows("[*:1]C(=O)O", [{"compound_id": "x", "R1": r}])[0][1]
+        for r, expected in (("iBu", "CC(C)CC(=O)O"), ("sBu", "CCC(C)C(=O)O"), ("iPent", "CC(C)CCC(=O)O"),
+                            ("tBu", "CC(C)(C)C(=O)O"), ("CH3", "CC(=O)O"), ("N(CH3)2", "CN(C)C(=O)O"),
+                            ("4-F-Ph", "O=C(O)c1ccc(F)cc1"), ("3-OMe-phenyl", "COc1cccc(C(=O)O)c1"),
+                            ("-OCH3", "COC(=O)O"), ("[*]C#N", "N#CC(=O)O")):
+            self.assertEqual(score.structure_key(acid(r)), score.structure_key(expected), r)
+
+    def test_converter_edge_cases(self):
+        docs, warnings = self._convert("""
+table: {doc_id: "D1", table_id: "T1"}
+scaffold: {cxsmiles: null, smiles: "*c1ccccc1"}
+rgroups:
+  - {compound_id: "1", R: "OH"}
+  - {compound_id: "2", R: "Cl"}
+  - ["3", "Br"]
+records:
+  - {compound_id: "", endpoint: "IC50", value: "5", unit: "nM"}
+---
+table: {doc_id: "D1", table_id: "T2"}
+scaffold: {cxsmiles: "not a smiles"}
+rgroups:
+  - {compound_id: "4", R1: "F"}
+compounds:
+  - {compound_id: "2", smiles: "C(C"}
+---
+table: {doc_id: "D1", table_id: "T3"}
+scaffold: {cxsmiles: "[*:1]c1ccccc1"}
+rgroups:
+  - {compound_id: "4", R1: "F"}
+""")
+        smiles = {c["id"]: c["smiles"] for c in docs[0]["compounds"]}
+        self.assertEqual(score.structure_key(smiles["1"]), score.structure_key("Oc1ccccc1"))   # bare * is R
+        self.assertEqual(score.structure_key(smiles["2"]), score.structure_key("Clc1ccccc1"))  # invalid duplicate ignored
+        self.assertEqual(score.structure_key(smiles["4"]), score.structure_key("Fc1ccccc1"))   # filled in by T3
+        self.assertIsNone(docs[0]["measurements"][0]["compound_id"])                          # unlabeled: unlinked
+        self.assertTrue(any("not mappings" in w for w in warnings))
+
+    def test_invalid_yaml_file_is_skipped(self):
+        import os, tempfile
+        try:
+            import yaml_to_jsonl
+        except SystemExit:
+            self.skipTest("PyYAML not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            good, bad = os.path.join(tmp, "good.yaml"), os.path.join(tmp, "bad.yaml")
+            with open(good, "w") as f:
+                f.write('table: {doc_id: "D2"}\nrecords:\n  - {compound_id: "1", endpoint: "IC50", value: "3"}\n')
+            with open(bad, "w") as f:
+                f.write('table: {doc_id: "D3"\nrecords: [\n')
+            warnings = []
+            tables = yaml_to_jsonl.load([bad, good], warn=warnings.append)
+        self.assertEqual(len(tables), 1)
+        self.assertTrue(any("bad.yaml" in w for w in warnings))
 
     def test_records_yaml_converts_and_scores(self):
         try:
@@ -759,6 +831,27 @@ class FileScoringTests(unittest.TestCase):
                 f.write(json.dumps(doc([{"id": "12a", "smiles": ASPIRIN}], [meas("12a", 12.3)])) + "\n")
             per_doc, _ = score.score_files(gold_path, pred_path)
         self.assertEqual(score.aggregate(per_doc)["record_f1"], 1.0)
+
+    def test_other_records_yaml_key_mistakes_are_format_errors(self):
+        import json, os, tempfile
+        gold = doc([{"id": "12a", "smiles": ASPIRIN}], [meas("12a", 12.3)])
+        bad_compounds = {"doc_id": "d1", "compounds": [{"compound_id": "12a", "smiles": ASPIRIN}],
+                         "measurements": [meas("12a", 12.3)]}
+        bad_records = {"doc_id": "d1", "compounds": [{"id": "12a", "smiles": ASPIRIN}], "records": [meas("12a", 12.3)]}
+        with tempfile.TemporaryDirectory() as tmp:
+            gold_path, pred_path = os.path.join(tmp, "gold.jsonl"), os.path.join(tmp, "pred.jsonl")
+            with open(gold_path, "w") as f:
+                f.write(json.dumps(gold) + "\n")
+            for bad, pattern in ((bad_compounds, "compounds use 'id'"), (bad_records, "no measurements")):
+                with open(pred_path, "w") as f:
+                    f.write(json.dumps(bad) + "\n")
+                with self.assertRaisesRegex(ValueError, pattern):
+                    score.score_files(gold_path, pred_path)
+
+    def test_schema_relation_cat_matches_a_printed_binned_value(self):
+        gold = doc([{"id": "1", "smiles": ASPIRIN}], [dict(meas("1", "A", unit=""), relation="cat")])
+        pred = doc([{"id": "1", "smiles": ASPIRIN}], [dict(meas("1", "A", unit=""), relation="")])
+        self.assertEqual(score.score_document(gold, pred)["record_tp"], 1)
 
     def test_group_field_office_is_carried_and_unknown_fields_fail(self):
         rows = [score.score_document(dict(doc([{"smiles": ASPIRIN}], doc_id=f"d{i}"), office=off), doc([{"smiles": ASPIRIN}], doc_id=f"d{i}"))
@@ -925,6 +1018,12 @@ class StatisticsTests(unittest.TestCase):
         self.assertGreater(screen["ci_hi"] - screen["ci_lo"], 0.3)   # ~2 x 1.645 x 0.2
         same = score.paired_compare(base, base)
         self.assertEqual(same["delta"], 0.0)
+        # Identical stored seeds (no seed effect): nothing is borrowed, the result equals 1 vs 1.
+        one = score.paired_compare(base[0], new)
+        triple = score.paired_compare([base[0]] * 3, new)
+        self.assertGreater(one["ci_hi"] - one["ci_lo"], 0.05)
+        self.assertAlmostEqual(one["ci_lo"], triple["ci_lo"], places=9)
+        self.assertAlmostEqual(one["ci_hi"], triple["ci_hi"], places=9)
 
     def test_null_simulation_runs_against_this_scorer(self):
         import numpy as np

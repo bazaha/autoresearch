@@ -18,7 +18,7 @@ Gold and predictions are JSONL files, one document (a page, a crop, or a patent)
 
 `family_id` (patent family / article; a paper and its SI share one) is the bootstrap cluster
 and defaults to doc_id; `slice` (gold only) is the source, used for per-slice reporting and
-slice weighting; `doc_type` (gold only: patent / paper / si) can replace it as the grouping
+slice weighting; `doc_type` (gold only: patent / paper / si / report) can replace it as the grouping
 (--group-field doc_type, the S2 macro-average; gold `office` and `language` work the same way);
 `tags` (gold only, optional list such as ["chiral", "abbrev", "large", "lowres"]) marks
 difficulty subsets that are reported separately (a document may carry several). An OCSR crop
@@ -372,7 +372,8 @@ _ENDPOINT_SYNONYMS = {
 }
 _PERCENT_ENDPOINTS = {"%inhibition", "f", "ppb"}   # an empty unit means '%'
 _RELATIONS = {"": "=", "=": "=", "==": "=", "~": "=", "≈": "=", "<": "<", "<=": "<", "≤": "<", "≦": "<", "⩽": "<",
-              ">": ">", ">=": ">", "≥": ">", "≧": ">", "⩾": ">", "range": "range"}
+              ">": ">", ">=": ">", "≥": ">", "≧": ">", "⩾": ">", "range": "range",
+              "cat": "="}   # deliverable schema: a binned value ('A', '+++') is compared by its text
 _FLIP = {"=": "=", "<": ">", ">": "<", "range": "range"}
 # Latin letters, digits and '%', plus Greek (PI3Kα vs PI3Kβ), CJK and kana (Chinese and
 # Japanese headers, targets, species). Text is NFKC-normalized first (fullwidth 'ＩＣ５０', '％').
@@ -1003,7 +1004,7 @@ def _norm_label(s):
     """
     if not isinstance(s, (str, int, float)) or isinstance(s, bool):
         return ""
-    if isinstance(s, str) and _LABEL_LIST.search(s):
+    if isinstance(s, str) and _LABEL_LIST.search(s.strip().strip(";；、 ")):
         return ""
     s = _LABEL_PREFIX.sub("", _nfkc(s).casefold().strip()).translate({0x2032: "'", 0x2033: "''", 0x2019: "'"})
     s = re.sub(r"(?<=\d)[^0-9a-z'\u3400-\u9fff]+(?=\d)", "§", s)
@@ -1527,21 +1528,26 @@ def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None, req
     new_rep = _slice_totals(new_m, order, w, new_k)
     base_pt, new_pt = _slice_totals(base_m, order), _slice_totals(new_m, order)
     # A one-seed side (the 1-vs-3 screen) carries no seed variance of its own: borrow it from the
-    # other side's between-seed spread, one normal draw per replicate shared by every quantity.
-    # Without this the screen's SE is too small and placebos pass it too often.
+    # other side's seeds, one normal draw per replicate shared by every quantity. Only the
+    # global part is borrowed: the spread of the stored seeds' scores also contains item-level
+    # run-to-run noise, which the paired document resampling already counts.
     nb, nn = len(base_runs), len(new_runs)
     multi = new_m if nb == 1 < nn else base_m if nn == 1 < nb else None
     z = rng.standard_normal(BOOTSTRAP_SAMPLES) if multi is not None else None
+    one_seed = np.ones((BOOTSTRAP_SAMPLES, 1))
 
     def jitter(f, mats=None):
         """Seed noise for the one-seed side of quantity f (0 when both sides have seeds)."""
         if z is None:
             return 0.0
         mats = multi if mats is None else mats
-        n = next(iter(mats.values())).shape[0]
-        vals = [float(f(_slice_totals({k: m[[i]] for k, m in mats.items()}, order))) for i in range(n)]
-        sd = float(np.std(vals, ddof=1))
-        return z * sd if math.isfinite(sd) else 0.0
+        seeds = [{k: m[[i]] for k, m in mats.items()} for i in range(next(iter(mats.values())).shape[0])]
+        vals = [float(f(_slice_totals(m, order))) for m in seeds]
+        reps = [f(_slice_totals(m, order, w, one_seed)) for m in seeds]
+        within = np.mean([np.var(reps[i] - reps[j], ddof=1) / 2
+                          for i in range(len(seeds)) for j in range(i + 1, len(seeds))])
+        var = float(np.var(vals, ddof=1)) - float(within)
+        return z * math.sqrt(var) if math.isfinite(var) and var > 0 else 0.0
 
     primary = lambda t: _primary(t, mode, slice_weights)
     deltas = primary(new_rep) - primary(base_rep) + jitter(primary)
@@ -1620,6 +1626,12 @@ def _check_pred_schema(pred_rows):
     cs = [c for d in pred_rows if isinstance(d.get("compounds"), list) for c in d["compounds"] if isinstance(c, dict)]
     if cs and not any("smiles" in c for c in cs):
         raise ValueError(f"schema mismatch: none of the {len(cs)} predicted compounds has smiles")
+    if cs and not any("id" in c for c in cs) and any("compound_id" in c for c in cs):
+        raise ValueError(f"schema mismatch: none of the {len(cs)} predicted compounds has id "
+                         "(found 'compound_id': compounds use 'id', measurements use 'compound_id')")
+    if not ms and any(k in d for d in pred_rows for k in ("records", "rgroups", "scaffold")):
+        raise ValueError("schema mismatch: records_yaml_v1 keys (records/rgroups/scaffold) but no measurements; "
+                         "convert with yaml_to_jsonl.py")
 
 
 def score_files(gold_path, pred_path):

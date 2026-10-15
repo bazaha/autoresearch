@@ -8,10 +8,11 @@ Result on 2026-10-15 (120 trials per row, nominal rate 5%):
   seed SD ~0.49 pp: pooled 2.5%,  hierarchical 0.8%
   seed SD ~0.56 pp: pooled 7.5%,  hierarchical 2.5%
   seed SD ~0.70 pp: pooled 10.8%, hierarchical 1.7%
-Screen, same simulated data per row (200 trials, nominal promising rate about 20%):
-  seed logit sd 0.00: v1.7.1 19.5%, v1.8 17.5%
-  seed logit sd 0.03: v1.7.1 17.0%, v1.8 13.5%
-  seed logit sd 0.05: v1.7.1 25.0%, v1.8 14.0%   (v1.8 borrows the missing seed variance)
+Screen (`python null_sim.py 200 screen`; 200 trials per row, nominal promising rate about 20%,
+Monte Carlo SE about 2.8 pp):
+  seed logit sd 0.00: v1.7.1 18.0%, v1.8 17.0%
+  seed logit sd 0.03: v1.7.1 17.5%, v1.8 15.5%
+  seed logit sd 0.05: v1.7.1 24.0%, v1.8 20.5%   (v1.8 borrows the missing global seed variance)
 """
 import os
 import sys

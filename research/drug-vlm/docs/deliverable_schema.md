@@ -46,6 +46,7 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `assay_uid` | str | `hash(doc_id, assay_label_norm)` |
+| `assay_label_norm` | str | 归一化的方法编号：先去掉 "Assay""Biological Assay""Biological Example""生物学实施例""测定"等前缀词，再按 `_norm_label` 处理（"Assay A"、"ASSAY A:"、"Biological Assay A" → "a"）；`measurements.assay_uid` 按它把表头里的引用连到方法段落 |
 | `doc_id` | str | |
 | `assay_label_as_printed` | str | "Assay A"、"Biological Example 1"、"生物学实施例 1" |
 | `target_as_printed`, `target_uniprot`, `variant` | str | 靶点与突变体 |
@@ -62,7 +63,7 @@
 | `doc_id` | str | 化合物没解析出来（`compound_uid` 为空）时记录也不丢文档 |
 | `compound_uid` | str | |
 | `assay_uid` | str | 所属实验方法；表头或脚注没有指向方法段落时为空 |
-| `endpoint` | enum | 封闭词表：`ic50`、`ki`、`kd`、`ec50`、`%inhibition`、`cl`、`clint`、`vss`、`t1/2`、`auc0inf`、`auc0t`、`auc024`、`cmax`、`f`、`ppb`、`papp_ab`、`papp_ba`、`efflux_ratio`、`solubility`、`logd`、`pka`、…（与 `score.py` 的终点名一致） |
+| `endpoint` | enum | 封闭词表：`ic50`、`ki`、`kd`、`ec50`、`%inhibition`、`cl`、`clint`、`vss`、`t1/2`、`auc0inf`、`auc0t`、`auc024`、`cmax`、`f`、`ppb`、`pappab`、`pappba`、`effluxratio`、`solubility`、`logd`、`pka`、`fu`、…（与 `score.py` 的终点名一致） |
 | `endpoint_as_printed` | str | 原文列头 |
 | `target_as_printed`, `target_uniprot`, `variant` | str | 靶点与突变体（"L858R/T790M"）；PK/理化记录为空；有 `assay_uid` 时默认取自 `assays` |
 | `assay_type` | enum | `biochemical` / `cell` / `binding` / `invivo` / … |
@@ -106,7 +107,7 @@
 | `value_as_printed` | `value`（原文字符串，保留末位 0） |
 | `endpoint_as_printed` / `endpoint` | `endpoint`（裸终点名更好；列头里的上下文写进下面的字段） |
 | `target_as_printed` | `target` |
-| `relation`、`unit_std` 前的原文单位 | `relation`、`unit` |
+| `relation`（`cat` 与空等价：评分器按 `value` 的文本比较分级值；`range` 也可留空，由 `value` 的区间判定）、`unit_std` 前的原文单位 | `relation`、`unit` |
 | `assay_type`、`species`、`variant` | 同名字段 |
 | `cell_line_or_matrix` | `matrix`（或 `cell_line`） |
 | `condition.conc`、`.time`、`.ph`、`.dose`、`.route` | 平铺：`conc`/`conc_unit`、`time`/`time_unit`、`ph`、`dose`/`dose_unit`、`route` |
@@ -160,7 +161,8 @@ records:
 你是药物化学数据整理员。下面是一张论文/专利里的表格截图（编号框已标在图上）、表格上方的母核结构图，
 以及（如有）表头引用的实验方法段落。请按 records_yaml_v1 输出：
 1. scaffold：母核的 CXSMILES，可变位置用 [*:n] 并标注 _Rn；看不清时写 null，不要猜。
-2. rgroups：每一行一个条目，compound_id 写化合物编号（按原文），R1、R2…写取代基（SMILES 片段或原文缩写）。
+2. rgroups：每一行一个条目，compound_id 写化合物编号（按原文），R1、R2…写取代基的 SMILES 片段，用 [*] 标出连接点
+   （如 –OCH3 写 [*]OC，4-氟苯基写 [*]c1ccc(F)cc1，氢写 [H]）；Me、Et、iPr、tBu、OMe、CF3、Ph 这类常用缩写可以照抄。
 3. records：每个单元格一条记录，compound_id 写该行的化合物编号。value 按原文抄写（保留 >、<、±、分级字母），
    unit 写原文单位；列头、脚注或实验方法段落里写明的靶点、细胞系、物种、实验类型、浓度、pH、剂量与途径
    填进对应字段；表头引用的方法编号（如 "Assay A"）写进 assay；没写的留空，不要推测。
