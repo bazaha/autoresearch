@@ -15,8 +15,13 @@ Gold and predictions are JSONL files, one document (a page, a crop, or a patent)
                      "value": [10, 30], "unit": "uM"}]}
 
 `family_id` (patent family / article) is the bootstrap cluster and defaults to doc_id;
-`slice` (gold only) groups documents for per-slice reporting. An OCSR crop is simply a
-document with one compound and no measurements. A value given as [lo, hi] is a range.
+`slice` (gold only) groups documents for per-slice reporting and slice weighting; `tags`
+(gold only, optional list such as ["stereo", "markush", "handwritten"]) marks difficulty
+subsets that are reported separately (a document may carry several tags). An OCSR crop is
+simply a document with one compound and no measurements. A value given as [lo, hi] is a
+range; value strings such as ">10", "10–30", "12 ± 3", "1.2 × 10⁻⁵", "10 µM" (unit inside the
+value) and "n.d." are parsed, and a unit missing from `unit` is taken from the value string or
+from the endpoint header ("IC50 (µM)").
 
 Structures are SMILES/CXSMILES. Markush/R-group positions are dummy atoms written as
 `[1*]`, `[*:1]` or a CXSMILES label (`*... |$R1$|`, `_R1`); all three mean R1. Racemic or
@@ -27,9 +32,13 @@ Usage:
     python score.py compare --base seed0.jsonl,seed1.jsonl --new seed0.jsonl,seed1.jsonl
     (compare takes per-doc files written by `score`; with several seeds per side, seed-to-seed
     variance enters the interval through a hierarchical family x seed bootstrap)
+    Both accept --scalar and --slice-weights (e.g. inhouse=0.3,biovista=0.3,uspto=0.2,mrbw=0.2);
+    compare also takes --alpha (two-sided CI level, default 0.10) and prints paired deltas with
+    bootstrap SEs for every slice, tag and guardrail rate.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -70,8 +79,9 @@ BOOTSTRAP_SEED = 0
 _morgan = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 _uncharger = rdMolStandardize.Uncharger()
 _salt_remover = rdMolStandardize.FragmentRemover()
-# Coordination complexes are keyed as drawn (standard InChI): salt stripping and RDKit's
-# metal disconnection would reduce cisplatin to ammonia. Alkali/alkaline-earth ions stay salts.
+# Structures with one of these metals bonded into them (coordination complexes, organometallics)
+# are keyed as drawn (standard InChI): salt stripping and RDKit's metal disconnection would
+# reduce cisplatin to ammonia. Free metal ions ([Zn+2].[O-]C(=O)...) are ordinary salts.
 _COMPLEX_METALS = {
     "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh",
     "Pd", "Ag", "Cd", "La", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Al", "Ga", "In", "Sn",
@@ -124,8 +134,8 @@ def _standardize(smiles):
         mol = mol.GetMol()
         if _is_markush(mol):
             return mol if mol.GetNumHeavyAtoms() <= MAX_HEAVY_ATOMS else None
-        if any(atom.GetSymbol() in _COMPLEX_METALS for atom in mol.GetAtoms()):
-            pass  # keyed as drawn
+        if any(atom.GetSymbol() in _COMPLEX_METALS and atom.GetDegree() > 0 for atom in mol.GetAtoms()):
+            pass  # a metal bonded into the structure: keyed as drawn (free metal ions stay salts)
         elif STRIP_SALTS:
             mol = rdMolStandardize.FragmentParent(mol)
             mol = _uncharger.uncharge(mol)
@@ -291,6 +301,20 @@ def _to_canonical(value, unit, mw=None):
 _NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?"
 _RANGE = re.compile(rf"^({_NUM})\s*(?:-|–|—|to)\s*({_NUM})$", re.I)
 _PREFIX = re.compile(r"^(<=|>=|≤|≥|<|>|~|≈|=)\s*")
+_WITH_UNIT = re.compile(rf"^({_NUM}(?:\s*(?:-|–|—|to)\s*{_NUM})?)\s*([^\d\s.+-].*)$", re.I)
+_TIMES_TEN = re.compile(r"\s*[x×*·]\s*10\s*\^?\s*([⁻⁺+-]?[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)")
+_SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+")
+_PLUS_MINUS = re.compile(rf"\s*\(?\s*(?:±|\+/-|\+-)\s*{_NUM}\s*\)?|\s*\(\s*n\s*=\s*\d+\s*\)", re.I)
+_KNOWN_UNITS = set(_MOLAR_TO_NM) | set(_MASS_TO_G_PER_L) | set(_TIME_TO_H) | {"%"}
+
+
+def _header_unit(endpoint):
+    """Unit written in the column header / endpoint name, e.g. 'IC50 (µM)' -> 'µM'."""
+    for group in re.findall(r"[\(\[]\s*([^\)\]]+?)\s*[\)\]]", str(endpoint or "")):
+        u = _norm_unit(group)
+        if u in _KNOWN_UNITS or (u and "/" in u and re.fullmatch(r"[a-z%./]+", u)):
+            return group
+    return ""
 
 
 def _half_unit(text):
@@ -303,8 +327,9 @@ def _half_unit(text):
 
 def _parse_value(raw, relation):
     """
-    -> (numbers, half_units, relation, category). Accepts numbers, [lo, hi], and strings such
-    as '1,200', '>10', '10-30', '10 to 30'; half_units is the printed precision of each number
+    -> (numbers, half_units, relation, category, inline_unit). Accepts numbers, [lo, hi], and
+    strings such as '1,200', '>10', '10-30', '10 to 30', '12 ± 3' (mean kept), '1.2 × 10⁻⁵',
+    '10 µM' (unit written in the value); half_units is the printed precision of each number
     (store gold values as printed strings to keep trailing zeros). Anything else non-empty
     ('NT', 'inactive', a binned 'A' or '+++') is a categorical value compared as text.
     """
@@ -314,21 +339,27 @@ def _parse_value(raw, relation):
     if isinstance(raw, (list, tuple)) or isinstance(raw, (int, float)):
         try:
             return (tuple(float(v) for v in items), tuple(_half_unit(repr(v) if isinstance(v, float) else str(v)) for v in items),
-                    relation, None)
+                    relation, None, "")
         except (TypeError, ValueError):
             return None
     s = str(raw).strip().replace("−", "-").replace(",", "")
+    s = _TIMES_TEN.sub(lambda mm: "e" + mm.group(1).translate(_SUPERSCRIPTS), s)
+    s = _PLUS_MINUS.sub("", s).strip()
     m = _PREFIX.match(s)
     if m:
         relation, s = (m.group(1) if relation in ("", "=") else relation), s[m.end():]
+    unit = ""
+    wu = None if _RANGE.match(s) or re.fullmatch(_NUM, s, re.I) else _WITH_UNIT.match(s)
+    if wu and re.search(r"[a-zA-Zµμ%]", wu.group(2)):
+        s, unit = wu.group(1).strip(), wu.group(2).strip()
     r = _RANGE.match(s)
     if r:
-        return (float(r.group(1)), float(r.group(2))), (_half_unit(r.group(1)), _half_unit(r.group(2))), relation, None
+        return (float(r.group(1)), float(r.group(2))), (_half_unit(r.group(1)), _half_unit(r.group(2))), relation, None, unit
     try:
-        return (float(s),), (_half_unit(s),), relation, None
+        return (float(s),), (_half_unit(s),), relation, None, unit
     except ValueError:
-        token = re.sub(r"[^0-9a-z+\-]+", "", s.casefold())
-        return ((), (), relation, token) if token else None
+        token = re.sub(r"[^0-9a-z+\-]+", "", (s + unit).casefold())
+        return ((), (), relation, token, "") if token else None
 
 
 def normalize_measurement(m, mw=None):
@@ -341,14 +372,18 @@ def normalize_measurement(m, mw=None):
     and mass concentrations (µg/mL) to nM using `mw`, the record's structure; `converted`
     marks both, so that the printed and a converted form can still match within rounding.
     `condition` is the test concentration of single-dose endpoints such as % inhibition,
-    given as conc/conc_unit or written in the endpoint ('% inh @ 1 µM').
+    given as conc/conc_unit or written in the endpoint ('% inh @ 1 µM'). An empty unit field
+    falls back to a unit written in the value ('10 µM') or in the header ('IC50 (µM)').
     """
     parsed = _parse_value(m.get("value"), str(m.get("relation") or "").strip())
     if parsed is None:
         return None
-    values, halves, relation, category = parsed
+    values, halves, relation, category, inline_unit = parsed
     if len(values) > 2 or not all(math.isfinite(v) for v in values):
         return None
+    unit = m.get("unit")
+    if not str(unit or "").strip():   # unit written in the value, else in the column header
+        unit = inline_unit or _header_unit(m.get("endpoint"))
     bounds = tuple((v - h, v + h) for v, h in zip(values, halves))
     endpoint = _norm_endpoint(m.get("endpoint"))
     target = _norm_text(m.get("target")) if MATCH_TARGET else ""
@@ -356,12 +391,12 @@ def normalize_measurement(m, mw=None):
     converted = False
     if category is not None:
         relation, unit_class = "cat:" + category, ""
-    elif endpoint in _P_ENDPOINTS and _norm_unit(m.get("unit")) in _PX_UNITS:
+    elif endpoint in _P_ENDPOINTS and _norm_unit(unit) in _PX_UNITS:
         endpoint, unit_class, converted = _P_ENDPOINTS[endpoint], "molar", True
         values, relation = tuple(10.0 ** (9.0 - v) for v in values), _FLIP.get(relation, relation)
         bounds = tuple((10.0 ** (9.0 - hi), 10.0 ** (9.0 - lo)) for lo, hi in bounds)
     else:
-        canon = [_to_canonical(v, m.get("unit"), mw) for v in values]
+        canon = [_to_canonical(v, unit, mw) for v in values]
         unit_class, converted = canon[0][0], canon[0][2]
         scale = [c[1] / v if v else 1.0 for c, v in zip(canon, values)]
         values = tuple(c[1] for c in canon)
@@ -443,11 +478,24 @@ def _close(gold, pred):
     return all(math.isclose(g, p, rel_tol=VALUE_REL_TOL, abs_tol=1e-12) for g, p in zip(gv, pv))
 
 
+def _max_matching(gold_vals, pred_vals):
+    """Maximum bipartite matching (augmenting paths) between gold and predicted values."""
+    owner = [-1] * len(pred_vals)
+
+    def assign(g, seen):
+        for j, p in enumerate(pred_vals):
+            if j not in seen and _close(gold_vals[g], p):
+                seen.add(j)
+                if owner[j] < 0 or assign(owner[j], seen):
+                    owner[j] = g
+                    return True
+        return False
+
+    return sum(assign(g, set()) for g in range(len(gold_vals)))
+
+
 def _record_tp(gold_recs, pred_recs):
-    """
-    One-to-one matching within each record key. Tolerance windows are order-preserving
-    intervals on the value line, so a sorted sweep gives the maximum matching.
-    """
+    """One-to-one maximum matching of values within each record key."""
     groups = {}
     for k, v in gold_recs:
         if k is not None:
@@ -455,18 +503,7 @@ def _record_tp(gold_recs, pred_recs):
     for k, v in pred_recs:
         if k is not None and k in groups:
             groups[k][1].append(v)
-    tp = 0
-    for gold_vals, pred_vals in groups.values():
-        gold_vals.sort()
-        pred_vals.sort()
-        used = [False] * len(pred_vals)
-        for g in gold_vals:
-            for i, p in enumerate(pred_vals):
-                if not used[i] and _close(g, p):
-                    used[i] = True
-                    tp += 1
-                    break
-    return tp
+    return sum(_max_matching(g, p) for g, p in groups.values())
 
 
 def score_document(gold, pred):
@@ -493,10 +530,15 @@ def score_document(gold, pred):
     g_measurements = list(gold.get("measurements") or [])
     g_recs = _records(g_measurements, g_table, by_label=False)
     p_recs = _records(p_measurements, p_table, by_label=False)
+    record_tp = _record_tp(g_recs, p_recs)
+    # as for structures: predictions of gold records this scorer cannot represent are excluded
+    n_gold_rec_unscorable = sum(1 for k, _ in g_recs if k is None)
+    n_pred_rec = len(p_recs) - min(n_gold_rec_unscorable, len(p_recs) - record_tp)
     return {
         "doc_id": gold.get("doc_id"),
         "family_id": gold.get("family_id") or gold.get("doc_id"),
         "slice": gold.get("slice") or "all",
+        "tags": sorted(set(gold.get("tags") or [])),
         "n_gold_unscorable": n_gold_unscorable,
         "struct_tp": struct_tp,
         "struct_tp_skeleton": _multiset_tp([s for _, s in g_valid], [s for _, s in p_valid]),
@@ -508,12 +550,12 @@ def score_document(gold, pred):
         "id_link_tp": _multiset_tp(g_ids, p_ids),
         "n_gold_id": len(g_ids),
         "n_pred_id": len(p_ids),
-        "record_tp": _record_tp(g_recs, p_recs),
+        "record_tp": record_tp,
         "record_tp_label": _record_tp(_records(g_measurements, g_table, by_label=True),
                                       _records(p_measurements, p_table, by_label=True)),
         "n_gold_rec": sum(1 for k, _ in g_recs if k is not None),
-        "n_gold_rec_unscorable": sum(1 for k, _ in g_recs if k is None),
-        "n_pred_rec": len(p_recs),
+        "n_gold_rec_unscorable": n_gold_rec_unscorable,
+        "n_pred_rec": n_pred_rec,
         "n_orphan_rec": sum(1 for m in p_measurements if _norm_label(m.get("compound_id")) not in p_table),
     }
 
@@ -521,8 +563,12 @@ def score_document(gold, pred):
 # Aggregation, composite score, bootstrap
 # ---------------------------------------------------------------------------
 
-_ID_FIELDS = ("doc_id", "family_id", "slice")
+_ID_FIELDS = ("doc_id", "family_id", "slice", "tags")
 SCALARS = ("auto", "composite", "struct_f1", "record_f1")
+# Guardrail rates reported with paired deltas and bootstrap SEs by `compare` (numerator, denominator).
+GUARDRAILS = {"invalid_smiles_rate": ("n_invalid_struct", "n_pred_struct"),
+              "multifragment_rate": ("n_multifrag_struct", "n_pred_struct"),
+              "orphan_record_rate": ("n_orphan_rec", "n_pred_rec")}
 
 
 def _ratio(a, b):
@@ -543,12 +589,34 @@ def resolve_scalar(per_doc, scalar="auto"):
     return "composite" if sum(d["n_gold_rec"] for d in per_doc) > 0 else "struct_f1"
 
 
+def parse_slice_weights(spec):
+    """'inhouse=0.3,biovista=0.3,uspto=0.2,mrbw=0.2' -> dict, or None for a plain micro-average."""
+    if not spec:
+        return None
+    return {name.strip(): float(w) for name, w in (part.split("=") for part in spec.split(","))}
+
+
 def _scalar_from(tot, scalar):
     """Primary scalar from totals (works elementwise on bootstrap arrays)."""
     struct_f1 = _f1(tot["struct_tp"], tot["n_pred_struct"], tot["n_gold_struct"])[0]
     record_f1 = _f1(tot["record_tp"], tot["n_pred_rec"], tot["n_gold_rec"])[0]
     return {"struct_f1": struct_f1, "record_f1": record_f1,
             "composite": W_STRUCT * struct_f1 + W_RECORD * record_f1}[scalar]
+
+
+def _primary(by_slice, scalar, slice_weights):
+    """
+    Primary scalar from per-slice totals. Without weights: the micro-average over everything.
+    With weights: sum_s w_s * scalar_s over the weighted slices present, renormalized
+    (slices without a weight are reported but do not enter the primary scalar).
+    """
+    if not slice_weights:
+        fields = next(iter(by_slice.values()))
+        return _scalar_from({f: sum(t[f] for t in by_slice.values()) for f in fields}, scalar)
+    present = [s for s in slice_weights if s in by_slice]
+    assert present, f"none of the weighted slices {sorted(slice_weights)} is in the data"
+    total = sum(slice_weights[s] for s in present)
+    return sum(slice_weights[s] * _scalar_from(by_slice[s], scalar) for s in present) / total
 
 
 def _totals(per_doc):
@@ -560,15 +628,21 @@ def _totals(per_doc):
     return tot
 
 
-def aggregate(per_doc, scalar="auto"):
+def _by_slice(per_doc):
+    groups = {}
+    for d in per_doc:
+        groups.setdefault(d.get("slice") or "all", []).append(d)
+    return {s: _totals(docs) for s, docs in groups.items()}
+
+
+def aggregate(per_doc, scalar="auto", slice_weights=None):
     mode = resolve_scalar(per_doc, scalar) if per_doc else "struct_f1"
     tot = _totals(per_doc)
     get = lambda k: tot.get(k, 0)
     struct_f1, struct_p, struct_r = _f1(get("struct_tp"), get("n_pred_struct"), get("n_gold_struct"))
     rec_f1, rec_p, rec_r = _f1(get("record_tp"), get("n_pred_rec"), get("n_gold_rec"))
     out = {
-        "score": _scalar_from({k: get(k) for k in ("struct_tp", "n_pred_struct", "n_gold_struct",
-                                                   "record_tp", "n_pred_rec", "n_gold_rec")}, mode),
+        "score": _primary(_by_slice(per_doc), mode, slice_weights) if per_doc else 0.0,
         "struct_f1": struct_f1,
         "struct_precision": struct_p,
         "struct_recall": struct_r,
@@ -584,17 +658,21 @@ def aggregate(per_doc, scalar="auto"):
         "orphan_record_rate": _ratio(get("n_orphan_rec"), get("n_pred_rec")),
     }
     out = {k: float(v) for k, v in out.items()}
-    out.update({"scalar": mode, "n_docs": len(per_doc), "n_gold_struct": get("n_gold_struct"),
-                "n_gold_unscorable": get("n_gold_unscorable"), "n_gold_rec": get("n_gold_rec"),
-                "n_gold_rec_unscorable": get("n_gold_rec_unscorable")})
+    out.update({"scalar": mode + ("/slice-weighted" if slice_weights else ""), "n_docs": len(per_doc),
+                "n_gold_struct": get("n_gold_struct"), "n_gold_unscorable": get("n_gold_unscorable"),
+                "n_gold_rec": get("n_gold_rec"), "n_gold_rec_unscorable": get("n_gold_rec_unscorable")})
     return out
 
+# Bootstrap. Clusters are (slice, patent family / article); resampling is stratified within
+# slices so every replicate keeps the slice composition fixed. With several seed runs per
+# side, seeds are resampled too (hierarchical), so seed-to-seed variance enters the interval.
 
-def _cluster_totals(per_doc, cluster_order=None):
-    """-> (cluster ids, {field: array of per-cluster totals})."""
+
+def _cluster_matrix(per_doc, order=None):
+    """-> (cluster keys, {field: per-cluster totals}) for one run."""
     fields = [k for k in per_doc[0] if k not in _ID_FIELDS]
-    keys = [d.get("family_id") or d["doc_id"] for d in per_doc]
-    order = cluster_order or sorted(set(keys))
+    keys = [(d.get("slice") or "all", d.get("family_id") or d["doc_id"]) for d in per_doc]
+    order = order or sorted(set(keys))
     index = {c: i for i, c in enumerate(order)}
     totals = np.zeros((len(order), len(fields)))
     np.add.at(totals, np.array([index[k] for k in keys]),
@@ -602,21 +680,47 @@ def _cluster_totals(per_doc, cluster_order=None):
     return order, {f: totals[:, j] for j, f in enumerate(fields)}
 
 
-def _bootstrap_scores(cols, weights, scalar):
-    """Scalar for every bootstrap replicate: weights is (replicates x clusters) resampling counts."""
-    return _scalar_from({f: weights @ v for f, v in cols.items()}, scalar)
+def _stack_runs(runs, order):
+    """Seed runs -> {field: (seeds x clusters) array}."""
+    per_run = [_cluster_matrix(r, order)[1] for r in runs]
+    return {f: np.stack([t[f] for t in per_run]) for f in per_run[0]}
 
 
-def _weights(n_clusters):
-    rng = np.random.default_rng(BOOTSTRAP_SEED)
-    return rng.multinomial(n_clusters, np.full(n_clusters, 1.0 / n_clusters), size=BOOTSTRAP_SAMPLES).astype(float)
+def _stratified_weights(order, rng):
+    """(replicates x clusters) resampling counts, multinomial within each slice."""
+    w = np.zeros((BOOTSTRAP_SAMPLES, len(order)))
+    for s in sorted({k[0] for k in order}):
+        idx = [i for i, k in enumerate(order) if k[0] == s]
+        w[:, idx] = rng.multinomial(len(idx), np.full(len(idx), 1.0 / len(idx)), size=BOOTSTRAP_SAMPLES)
+    return w
 
 
-def bootstrap_ci(per_doc, alpha=0.05, scalar="auto"):
-    """Percentile CI of the primary scalar, resampling patent families / articles (clusters)."""
+def _seed_weights(n_seeds, rng):
+    return rng.multinomial(n_seeds, np.full(n_seeds, 1.0 / n_seeds), size=BOOTSTRAP_SAMPLES).astype(float)
+
+
+def _slice_totals(mats, order, w=None, k=None):
+    """
+    {slice: {field: totals}}: point totals (w is None), or one value per replicate where w are
+    cluster resampling counts and k are seed resampling counts (replicates x seeds).
+    """
+    out = {}
+    for s in sorted({key[0] for key in order}):
+        idx = np.array([i for i, key in enumerate(order) if key[0] == s])
+        if w is None:
+            out[s] = {f: float(m[:, idx].sum()) for f, m in mats.items()}
+        else:
+            out[s] = {f: ((w[:, idx] @ m[:, idx].T) * k).sum(axis=1) for f, m in mats.items()}
+    return out
+
+
+def bootstrap_ci(per_doc, alpha=0.05, scalar="auto", slice_weights=None):
+    """Percentile CI of the primary scalar, resampling (slice, family) clusters within slices."""
     mode = resolve_scalar(per_doc, scalar)
-    order, cols = _cluster_totals(per_doc)
-    scores = _bootstrap_scores(cols, _weights(len(order)), mode)
+    order, cols = _cluster_matrix(per_doc)
+    mats = {f: v[None, :] for f, v in cols.items()}
+    w = _stratified_weights(order, np.random.default_rng(BOOTSTRAP_SEED))
+    scores = _primary(_slice_totals(mats, order, w, np.ones((BOOTSTRAP_SAMPLES, 1))), mode, slice_weights)
     return float(np.quantile(scores, alpha / 2)), float(np.quantile(scores, 1 - alpha / 2))
 
 
@@ -625,43 +729,62 @@ def _as_runs(x):
     return [x] if x and isinstance(x[0], dict) else list(x)
 
 
-def paired_compare(base, new, alpha=0.10, scalar="auto"):
+def _guard_value(by_slice, num, den):
+    return _ratio(sum(t[num] for t in by_slice.values()), sum(t[den] for t in by_slice.values()))
+
+
+def paired_compare(base, new, alpha=0.10, scalar="auto", slice_weights=None):
     """
     delta = score(new) - score(base), paired on shared doc_ids. `base` and `new` are one run
-    or a list of seed runs each. The bootstrap is hierarchical: every replicate resamples
-    patent families / articles (shared by both sides, which is the pairing) and, separately
-    for each side, its seeds; so seed-to-seed variance is part of the interval. With one
-    seed per side it cannot be, and the result is only a screen.
+    or a list of seed runs each. Every bootstrap replicate resamples (slice, family) clusters
+    within slices (shared by both sides, which is the pairing) and, separately for each side,
+    its seeds; with one seed per side, seed variance cannot enter and the result is only a
+    screen. Also returns paired deltas with bootstrap SEs for every slice scalar and guardrail
+    rate, and for every difficulty tag (gold `tags`, several per document), so that vetoes can
+    be scaled to their own noise (veto if delta < -k * se).
     """
     base_runs, new_runs = _as_runs(base), _as_runs(new)
-    fam = {d["doc_id"]: d.get("family_id") or d["doc_id"] for d in base_runs[0]}
-    ids = set(fam)
+    gold_keys = {d["doc_id"]: (d.get("slice") or "all", d.get("family_id") or d["doc_id"]) for d in base_runs[0]}
+    ids = set(gold_keys)
     for run in base_runs + new_runs:
         ids &= {d["doc_id"] for d in run}
-    ids = sorted(ids)
     assert ids, "no shared doc_ids between the runs"
-    keep = lambda run: [dict(d, family_id=fam[d["doc_id"]]) for d in run if d["doc_id"] in set(ids)]
+    keep = lambda run: [dict(d, slice=gold_keys[d["doc_id"]][0], family_id=gold_keys[d["doc_id"]][1])
+                        for d in run if d["doc_id"] in ids]
     base_runs, new_runs = [keep(r) for r in base_runs], [keep(r) for r in new_runs]
     mode = resolve_scalar(base_runs[0], scalar)
-    order, _ = _cluster_totals(base_runs[0])
-    def stack(runs):
-        per_run = [_cluster_totals(r, order)[1] for r in runs]
-        return {f: np.stack([t[f] for t in per_run]) for f in per_run[0]}
-    base_m, new_m = stack(base_runs), stack(new_runs)
+    order, _ = _cluster_matrix(base_runs[0])
+    base_m, new_m = _stack_runs(base_runs, order), _stack_runs(new_runs, order)
     rng = np.random.default_rng(BOOTSTRAP_SEED)
-    w = rng.multinomial(len(order), np.full(len(order), 1.0 / len(order)), size=BOOTSTRAP_SAMPLES).astype(float)
+    w = _stratified_weights(order, rng)
+    base_k, new_k = _seed_weights(len(base_runs), rng), _seed_weights(len(new_runs), rng)
+    base_rep = _slice_totals(base_m, order, w, base_k)
+    new_rep = _slice_totals(new_m, order, w, new_k)
+    base_pt, new_pt = _slice_totals(base_m, order), _slice_totals(new_m, order)
 
-    def replicates(mats, n_seeds):
-        k = rng.multinomial(n_seeds, np.full(n_seeds, 1.0 / n_seeds), size=BOOTSTRAP_SAMPLES).astype(float)
-        return _scalar_from({f: ((w @ m.T) * k).sum(axis=1) for f, m in mats.items()}, mode)
-
-    point = lambda mats: float(_scalar_from({f: m.sum() for f, m in mats.items()}, mode))
-    deltas = replicates(new_m, len(new_runs)) - replicates(base_m, len(base_runs))
-    seed_scores = lambda runs: [round(aggregate(r, mode)["score"], 6) for r in runs]
-    return {"delta": point(new_m) - point(base_m), "ci_lo": float(np.quantile(deltas, alpha / 2)),
-            "ci_hi": float(np.quantile(deltas, 1 - alpha / 2)),
+    deltas = _primary(new_rep, mode, slice_weights) - _primary(base_rep, mode, slice_weights)
+    paired = lambda f: (float(f(new_pt) - f(base_pt)), float(np.std(f(new_rep) - f(base_rep), ddof=1)))
+    guards = {g: paired(lambda t, num=num, den=den: _guard_value(t, num, den)) for g, (num, den) in GUARDRAILS.items()}
+    slices = {s: paired(lambda t, s=s: _scalar_from(t[s], mode)) for s in base_pt}
+    tags = {}
+    tag_docs = {}  # tag -> doc_ids, from the first base run so every run is cut the same way
+    for d in base_runs[0]:
+        for t in d.get("tags") or []:
+            tag_docs.setdefault(t, set()).add(d["doc_id"])
+    for tag, members in sorted(tag_docs.items()):
+        sub = lambda runs: _stack_runs([[d for d in r if d["doc_id"] in members] for r in runs], order)
+        tb, tn = sub(base_runs), sub(new_runs)
+        whole = lambda tot: _scalar_from({f: sum(t[f] for t in tot.values()) for f in next(iter(tot.values()))}, mode)
+        pt = whole(_slice_totals(tn, order)) - whole(_slice_totals(tb, order))
+        rep_d = whole(_slice_totals(tn, order, w, new_k)) - whole(_slice_totals(tb, order, w, base_k))
+        tags[tag] = (float(pt), float(np.std(rep_d, ddof=1)))
+    seed_scores = lambda runs: [round(aggregate(r, mode, slice_weights)["score"], 6) for r in runs]
+    return {"delta": float(_primary(new_pt, mode, slice_weights) - _primary(base_pt, mode, slice_weights)),
+            "ci_lo": float(np.quantile(deltas, alpha / 2)), "ci_hi": float(np.quantile(deltas, 1 - alpha / 2)),
             "p_not_better": float(np.mean(deltas <= 0)), "n_shared": len(ids), "n_clusters": len(order),
-            "scalar": mode, "base_seed_scores": seed_scores(base_runs), "new_seed_scores": seed_scores(new_runs)}
+            "scalar": mode + ("/slice-weighted" if slice_weights else ""),
+            "base_seed_scores": seed_scores(base_runs), "new_seed_scores": seed_scores(new_runs),
+            "guardrails": guards, "slices": slices, "tags": tags}
 
 
 def pool_seeds(runs):
@@ -718,6 +841,11 @@ def _check_rdkit():
                  f"(set SCORE_ALLOW_RDKIT_MISMATCH=1 to override for exploration only)")
 
 
+def _sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fixed scorer for structure + property extraction")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -726,12 +854,16 @@ def main():
     s.add_argument("--pred", required=True)
     s.add_argument("--per-doc-out", default=None)
     s.add_argument("--scalar", choices=SCALARS, default="auto")
+    s.add_argument("--slice-weights", default=None, help="e.g. inhouse=0.3,biovista=0.3,uspto=0.2,mrbw=0.2")
     c = sub.add_parser("compare")
     c.add_argument("--base", required=True, help="per-doc file(s), comma-separated seeds")
     c.add_argument("--new", required=True, help="per-doc file(s), comma-separated seeds")
     c.add_argument("--scalar", choices=SCALARS, default="auto")
+    c.add_argument("--slice-weights", default=None)
+    c.add_argument("--alpha", type=float, default=0.10, help="two-sided; 0.05 gives a 95%% CI")
     args = parser.parse_args()
     _check_rdkit()
+    weights = parse_slice_weights(args.slice_weights)
 
     if args.cmd == "score":
         per_doc, n_missing = score_files(args.gold, args.pred)
@@ -739,31 +871,38 @@ def main():
             with open(args.per_doc_out, "w") as f:
                 for d in per_doc:
                     f.write(json.dumps(d) + "\n")
-        summary = aggregate(per_doc, args.scalar)
-        lo, hi = bootstrap_ci(per_doc, scalar=args.scalar)
+        summary = aggregate(per_doc, args.scalar, weights)
+        lo, hi = bootstrap_ci(per_doc, scalar=args.scalar, slice_weights=weights)
         print("---")
         for k, v in summary.items():
             print(f"{k + ':':22s}{v:.6f}" if isinstance(v, float) else f"{k + ':':22s}{v}")
         print(f"{'score_ci95:':22s}[{lo:.6f}, {hi:.6f}]")
         print(f"{'missing_pred_docs:':22s}{n_missing}")
         print(f"{'rdkit_version:':22s}{RDKIT_VERSION}")
+        print(f"{'gold_sha256:':22s}{_sha256(args.gold)}")
+        print(f"{'scorer_sha256:':22s}{_sha256(os.path.abspath(__file__))}")
+        mode = resolve_scalar(per_doc, args.scalar)
         slices = sorted({d["slice"] for d in per_doc})
-        if len(slices) > 1:
-            for name in slices:
-                sl = aggregate([d for d in per_doc if d["slice"] == name], summary["scalar"])
-                print(f"{'slice/' + name + ':':22s}score={sl['score']:.6f} n_docs={sl['n_docs']}")
+        groups = [("slice", n, [d for d in per_doc if d["slice"] == n]) for n in slices] if len(slices) > 1 else []
+        groups += [("tag", t, [d for d in per_doc if t in d["tags"]]) for t in sorted({t for d in per_doc for t in d["tags"]})]
+        for kind, name, docs in groups:
+            sl = aggregate(docs, mode)
+            print(f"{kind + '/' + name + ':':22s}score={sl['score']:.6f} n_docs={sl['n_docs']}")
     else:
         load = lambda spec: [_read_jsonl(p)[0] for p in spec.split(",")]
-        r = paired_compare(load(args.base), load(args.new), scalar=args.scalar)
+        r = paired_compare(load(args.base), load(args.new), alpha=args.alpha, scalar=args.scalar, slice_weights=weights)
         print("---")
         print(f"{'delta:':22s}{r['delta']:+.6f}")
-        print(f"{'delta_ci90:':22s}[{r['ci_lo']:+.6f}, {r['ci_hi']:+.6f}]")
+        print(f"{'delta_ci%d:' % round(100 * (1 - args.alpha)):22s}[{r['ci_lo']:+.6f}, {r['ci_hi']:+.6f}]")
         print(f"{'p_not_better:':22s}{r['p_not_better']:.4f}")
         print(f"{'n_shared_docs:':22s}{r['n_shared']}")
         print(f"{'n_clusters:':22s}{r['n_clusters']}")
         print(f"{'scalar:':22s}{r['scalar']}")
         print(f"{'base_seed_scores:':22s}{r['base_seed_scores']}")
         print(f"{'new_seed_scores:':22s}{r['new_seed_scores']}")
+        for group in ("guardrails", "slices", "tags"):
+            for name, (d, se) in r[group].items():
+                print(f"{group[:-1] + '/' + name + ':':22s}delta={d:+.6f} se={se:.6f}")
 
 
 if __name__ == "__main__":

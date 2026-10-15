@@ -64,6 +64,10 @@ class StructureKeyTests(unittest.TestCase):
         self.assertEqual(cisplatin, score.structure_key("[NH3+][Pt-2]([NH3+])(Cl)Cl"))
         self.assertNotEqual(cisplatin, score.structure_key("N"))
 
+    def test_free_metal_counterions_are_salts(self):
+        zn_salt = "CC(=O)Oc1ccccc1C(=O)[O-].CC(=O)Oc1ccccc1C(=O)[O-].[Zn+2]"
+        self.assertEqual(score.structure_key(zn_salt), score.structure_key(ASPIRIN))
+
     def test_atom_maps_and_labels_on_real_atoms_are_ignored(self):
         self.assertEqual(score.structure_key("[CH3:1][C:2](=O)O"), score.structure_key("CC(=O)O"))
         self.assertEqual(score.structure_key("[1*]c1ccc(C)cc1 |$;;;;Me;;;$|"), score.structure_key("[1*]c1ccc(C)cc1"))
@@ -120,6 +124,17 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(score.normalize_measurement(meas("1", "1,200"))[5], (1200.0,))
         self.assertEqual(score.normalize_measurement(meas("1", "−0.5", unit="", endpoint="logD"))[5], (-0.5,))
         self.assertEqual(score.normalize_measurement(meas("1", "1e-5", unit="M"))[5], (1e-5 * 1e9,))
+
+    def test_value_strings_with_error_exponent_and_unit(self):
+        ref = score.normalize_measurement(meas("1", 12.0))
+        self.assertEqual(score.normalize_measurement(meas("1", "12 ± 3"))[:6], ref[:6])
+        self.assertEqual(score.normalize_measurement(meas("1", "12 (n=3)"))[:6], ref[:6])
+        sci = score.normalize_measurement(meas("1", "1.2 × 10⁻⁵", unit="M"))
+        self.assertAlmostEqual(sci[5][0], 12000.0)
+        ten_um = score.normalize_measurement(meas("1", 10, unit="uM"))
+        self.assertEqual(score.normalize_measurement(meas("1", "10 µM", unit=""))[:6], ten_um[:6])
+        # unit only in the column header
+        self.assertEqual(score.normalize_measurement(meas("1", 10, unit="", endpoint="IC50 (µM)"))[:6], ten_um[:6])
 
     def test_more_unit_and_endpoint_spellings(self):
         a = score.normalize_measurement(meas("1", 5, unit="µmol/L"))
@@ -297,6 +312,25 @@ class DocumentScoringTests(unittest.TestCase):
         self.assertEqual(s["struct_precision"], 1.0)
         self.assertEqual(s["n_gold_unscorable"], 1)
 
+    def test_record_matching_is_maximal(self):
+        # gold prints 50 and 50.4 nM; the model writes pIC50. 50.4 nM fits both rounding windows,
+        # 49.8 nM only the window of "50": a greedy match would find one record, the best two.
+        import math
+        px = lambda nm: round(9 - math.log10(nm), 6)
+        gold = doc([{"id": "1", "smiles": ASPIRIN}], [meas("1", 50), meas("1", 50.4)])
+        pred = doc([{"id": "1", "smiles": ASPIRIN}],
+                   [meas("1", px(50.4), unit="", endpoint="pIC50"), meas("1", px(49.8), unit="", endpoint="pIC50")])
+        self.assertEqual(score.score_document(gold, pred)["record_tp"], 2)
+
+    def test_unscorable_gold_records_excluded_from_both_sides(self):
+        gold = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": "not-a-smiles"}],
+                   [meas("1", 12.3), meas("2", 450.0)])
+        pred = doc([{"id": "1", "smiles": ASPIRIN}, {"id": "2", "smiles": PARACETAMOL}],
+                   [meas("1", 12.3), meas("2", 450.0)])
+        s = score.aggregate([score.score_document(gold, pred)])
+        self.assertEqual((s["record_precision"], s["record_recall"]), (1.0, 1.0))
+        self.assertEqual(s["n_gold_rec_unscorable"], 1)
+
     def test_empty_prediction(self):
         s = score.aggregate([score.score_document(self.gold, {})])
         self.assertEqual(s["score"], 0.0)
@@ -385,6 +419,44 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(r["delta"], 0.0)
         self.assertEqual(r["p_not_better"], 1.0)
 
+
+    def _sliced(self, plan):
+        """plan: [(slice, n_correct, n_total, tags)] -> per-doc rows."""
+        rows = []
+        for sl, n_correct, n_total, tags in plan:
+            for i in range(n_total):
+                gold = dict(doc([{"smiles": ASPIRIN}], doc_id=f"{sl}{i}"), slice=sl, tags=list(tags))
+                rows.append(score.score_document(gold, doc([{"smiles": ASPIRIN if i < n_correct else PARACETAMOL}],
+                                                           doc_id=f"{sl}{i}")))
+        return rows
+
+    def test_slice_weights(self):
+        rows = self._sliced([("patent", 90, 100, ()), ("paper", 10, 20, ())])
+        self.assertAlmostEqual(score.aggregate(rows)["score"], 100 / 120)  # micro-average
+        w = score.parse_slice_weights("patent=1, paper=1")
+        self.assertEqual(w, {"patent": 1.0, "paper": 1.0})
+        self.assertAlmostEqual(score.aggregate(rows, slice_weights=w)["score"], (0.9 + 0.5) / 2)
+        self.assertAlmostEqual(score.aggregate(rows, slice_weights={"paper": 1, "absent": 5})["score"], 0.5)
+        self.assertIsNone(score.parse_slice_weights(""))
+
+    def test_compare_reports_slices_tags_and_guardrails(self):
+        base = self._sliced([("patent", 60, 100, ("stereo",)), ("paper", 60, 100, ())])
+        new = self._sliced([("patent", 40, 100, ("stereo",)), ("paper", 90, 100, ())])
+        r = score.paired_compare(base, new, slice_weights={"patent": 1, "paper": 1})
+        self.assertAlmostEqual(r["delta"], 0.05)
+        self.assertAlmostEqual(r["slices"]["patent"][0], -0.20)
+        self.assertAlmostEqual(r["slices"]["paper"][0], 0.30)
+        self.assertAlmostEqual(r["tags"]["stereo"][0], -0.20)
+        self.assertGreater(r["tags"]["stereo"][1], 0.0)  # bootstrap SE
+        self.assertEqual(set(r["guardrails"]), set(score.GUARDRAILS))
+        self.assertEqual(r["guardrails"]["invalid_smiles_rate"], (0.0, 0.0))
+
+    def test_smaller_alpha_gives_wider_interval(self):
+        base, new = self._per_doc(60, 200), self._per_doc(70, 200)
+        r90, r99 = score.paired_compare(base, new, alpha=0.10), score.paired_compare(base, new, alpha=0.01)
+        self.assertLess(r99["ci_lo"], r90["ci_lo"])
+        self.assertGreater(r99["ci_hi"], r90["ci_hi"])
+        self.assertEqual(r90["p_not_better"], r99["p_not_better"])
 
 if __name__ == "__main__":
     unittest.main()
