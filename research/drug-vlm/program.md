@@ -56,7 +56,7 @@ SAR 表格与活性记录是 S2（第 5 周起），届时会有新版本的 pro
 
 | 组件 | 作用 | 状态 | 验收方式 |
 |---|---|---|---|
-| `harness/score.py` + `test_score.py` | 固定评分（相当于 `evaluate_bpb`） | 已有 v1.5 | `python3 -m unittest discover -s harness -p "test_*.py"` 全部通过 |
+| `harness/score.py` + `test_score.py` | 固定评分（相当于 `evaluate_bpb`；说明见 `harness/README.md`） | 已有 v1.7 | `python3 -m unittest discover -s harness -p "test_*.py"` 全部通过 |
 | `harness/null_sim.py` | 检查配对比较在零效应下的误保留率 | 已有 | `python3 harness/null_sim.py`：层次 bootstrap 的误保留率不高于名义水平 |
 | `harness/formats.py` + `abbrev_v1.tsv` + `golden_pairs.tsv` | 各种输出格式 → RDKit 分子；超原子缩写展开 | 待建 | 约 200 条黄金对（互变异构、盐、E/Z、增强立体、R 基团、同位素、金属）全过；缩写表能复现每一个含超原子的金标 |
 | `harness/dvlm/`（`load_base`、`pools`、`Meter`、`render`、增强算子、`rewards`、`save_adapter`） | 训练侧的唯一入口 | 待建 | Meter 计数与优化器步数相差 ≤ 2%；`render` 的数据门禁能拦截评测分子 |
